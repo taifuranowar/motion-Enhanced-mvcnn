@@ -386,7 +386,7 @@ def generate_camera_positions(args):
             angle = i * 2 * math.pi / args.num_views
             x = circle_radius * math.cos(angle)
             y = circle_radius * math.sin(angle)
-            azimuth = i * 360 / args.num_views
+            azimuth = i * 360 / args.num_views;
             
             positions.append({
                 "position": (x, y, z),
@@ -400,6 +400,18 @@ def generate_camera_positions(args):
 def create_visualization_markers(camera_positions, args):
     """Create visual markers to show camera positions"""
     markers = []
+    
+    # Define some vibrant colors
+    colors = [
+        (1.0, 0.2, 0.2, 1.0),  # Red
+        (0.2, 1.0, 0.2, 1.0),  # Green
+        (0.2, 0.2, 1.0, 1.0),  # Blue
+        (1.0, 1.0, 0.2, 1.0),  # Yellow
+        (1.0, 0.2, 1.0, 1.0),  # Magenta
+        (0.2, 1.0, 1.0, 1.0),  # Cyan
+        (1.0, 0.6, 0.0, 1.0),  # Orange
+        (0.6, 0.0, 1.0, 1.0),  # Purple
+    ]
     
     for i, pos in enumerate(camera_positions):
         # Create marker for camera position
@@ -417,25 +429,32 @@ def create_visualization_markers(camera_positions, args):
         rot_quat = direction.to_track_quat('Z', 'Y')
         marker.rotation_euler = rot_quat.to_euler()
         
-        # Create material
+        # Create material with simple diffuse setup
         mat = bpy.data.materials.new(name=f"MarkerMaterial_{i}")
-        mat.use_nodes = True
-        nodes = mat.node_tree.nodes
-        principled = nodes.get("Principled BSDF")
         
-        # Color based on elevation
-        elev_idx = i // (args.num_views)
-        if elev_idx == 0:
-            principled.inputs["Base Color"].default_value = (0.2, 0.8, 0.2, 1.0)  # Green
+        # Select color based on elevation
+        elev_idx = i // args.num_views
+        color_idx = elev_idx % len(colors)
+        
+        # Make material with basic color - no nodes
+        mat.use_nodes = False
+        mat.diffuse_color = colors[color_idx]
+        
+        # Assign material
+        if len(marker.data.materials) > 0:
+            marker.data.materials[0] = mat
         else:
-            principled.inputs["Base Color"].default_value = (0.2, 0.2, 0.8, 1.0)  # Blue
-            
-        marker.data.materials.append(mat)
+            marker.data.materials.append(mat)
+        
+        # Make sure the material is visible in viewport
+        marker.active_material = mat
         
         # Mark as not renderable (hide from renders)
         marker.hide_render = True
         
         markers.append(marker)
+    
+    # Path lines are removed - no longer connecting camera markers
     
     return markers
 
@@ -685,7 +704,7 @@ def run_camera_animation_demo(args):
         camera.location = next_pos["position"]
         direction = Vector((0, 0, 0)) - Vector(camera.location)
         rot_quat = direction.to_track_quat('-Z', 'Y')
-        camera.rotation_euler = rot_quat.to_euler()
+        camera.rotation_euler = rot_quat.to_euler();
         
         camera.keyframe_insert(data_path="location", frame=current_frame)
         camera.keyframe_insert(data_path="rotation_euler", frame=current_frame)
