@@ -298,36 +298,51 @@ def setup_camera():
 
 def import_off_file(filepath):
     """Import an OFF file and return the object"""
-    # Parse OFF file manually since Blender doesn't support it natively
     with open(filepath, 'r') as f:
         lines = f.readlines()
-    
+
     # Skip comments and empty lines
     lines = [l.strip() for l in lines if not l.startswith('#') and l.strip()]
-    
-    # Check OFF header
-    if lines[0] != "OFF":
-        lines.insert(0, "")  # Handle case where "OFF" is on same line as counts
-    
-    # Parse vertex and face counts
-    if lines[0] == "OFF":
-        counts = lines[1].split()
+
+    if not lines:
+        print(f"Error: OFF file is empty: {filepath}")
+        return None
+
+    # Handle header and counts
+    if lines[0].startswith("OFF"):
+        header = lines[0].split()
+        if len(header) == 1:
+            # Standard: OFF on first line, counts on second
+            if len(lines) < 2:
+                print(f"Error: OFF file missing counts line: {filepath}")
+                return None
+            counts = lines[1].split()
+            data_start = 2
+        else:
+            # Compact: OFF and counts on same line
+            counts = header[1:]
+            data_start = 1
     else:
-        header = lines[0].replace("OFF", "").strip()
-        counts = header.split()
-    
+        print(f"Error: OFF header missing in file: {filepath}")
+        return None
+
+    if len(counts) < 2:
+        print(f"Error: OFF file counts line malformed: {filepath}")
+        return None
+
     n_verts = int(counts[0])
     n_faces = int(counts[1])
-    
-    # Read vertices and faces
+
+    # Read vertices
     vertices = []
     for i in range(n_verts):
-        vcoords = lines[i + 2].split()
+        vcoords = lines[data_start + i].split()
         vertices.append((float(vcoords[0]), float(vcoords[1]), float(vcoords[2])))
-    
+
+    # Read faces
     faces = []
     for i in range(n_faces):
-        fverts = lines[i + 2 + n_verts].split()
+        fverts = lines[data_start + n_verts + i].split()
         face_vert_count = int(fverts[0])
         face_indices = [int(fverts[j]) for j in range(1, face_vert_count + 1)]
         faces.append(face_indices)
