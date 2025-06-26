@@ -60,17 +60,24 @@ def parse_args():
     parser.add_argument('--resume', type=str, default=None,
                         help='Path to checkpoint to resume from')
     
+    # Add max-views parameter
+    parser.add_argument('--max-views', type=int, default=None,
+                        help='Maximum number of views to use per model (default: use all available views)')
+    
     args = parser.parse_args()
     return args
 
 # ========== Dataset Handling ==========
 class MVCNNDataset(Dataset):
+    printed_view_count = False  # Class variable to control printing
+
     """Multi-View CNN Dataset"""
-    def __init__(self, dataset_path, split='train', transform=None, selected_classes=None):
+    def __init__(self, dataset_path, split='train', transform=None, selected_classes=None, max_views=None):
         self.dataset_path = dataset_path
         self.split = split
         self.transform = transform
         self.selected_classes = selected_classes
+        self.max_views = max_views
         
         # Path to renders directory
         self.renders_path = os.path.join(dataset_path, 'renders')
@@ -105,6 +112,7 @@ class MVCNNDataset(Dataset):
             else:  # test or val
                 models_data = class_data['test_models']
             
+            # When collecting view files:
             for model_data in models_data:
                 model_name = model_data['model_name']
                 model_path = os.path.join(self.renders_path, class_name, split, model_name)
@@ -118,6 +126,10 @@ class MVCNNDataset(Dataset):
                 for view in sorted(model_metadata['views'], key=lambda x: x['view_idx']):
                     view_files.append(os.path.join(model_path, view['filename']))
                 
+                # Limit the number of views if specified
+                if self.max_views is not None:
+                    view_files = view_files[:self.max_views]
+                
                 self.samples.append({
                     'class_name': class_name,
                     'class_idx': class_idx,
@@ -130,18 +142,17 @@ class MVCNNDataset(Dataset):
     
     def __getitem__(self, idx):
         sample = self.samples[idx]
-        
-        # Load all views for this model
         views = []
+        # Print the number of views for this sample only once per session
+        if not MVCNNDataset.printed_view_count:
+            print(f"Number of views per sample: {len(sample['view_files'])}")
+            MVCNNDataset.printed_view_count = True
         for view_file in sample['view_files']:
             img = Image.open(view_file).convert('RGB')
             if self.transform:
                 img = self.transform(img)
             views.append(img)
-        
-        # Stack views into a tensor [num_views, channels, height, width]
         views = torch.stack(views)
-        
         return {
             'views': views,
             'label': sample['class_idx'],
@@ -337,8 +348,10 @@ def main():
     ])
     
     # Create datasets
-    train_dataset = MVCNNDataset(args.dataset_path, split='train', transform=train_transform, selected_classes=selected_classes)
-    test_dataset = MVCNNDataset(args.dataset_path, split='test', transform=test_transform, selected_classes=selected_classes)
+    train_dataset = MVCNNDataset(args.dataset_path, split='train', transform=train_transform, 
+                                selected_classes=selected_classes, max_views=args.max_views)
+    test_dataset = MVCNNDataset(args.dataset_path, split='test', transform=test_transform,
+                               selected_classes=selected_classes, max_views=args.max_views)
     
     # Filter selected classes if specified
     if args.selected_classes:

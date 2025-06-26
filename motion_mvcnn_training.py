@@ -20,6 +20,10 @@ import seaborn as sns
 def parse_args():
     parser = argparse.ArgumentParser(description='Motion Enhanced MVCNN Training')
     
+    # Add max-views parameter
+    parser.add_argument('--max-views', type=int, default=None,
+                        help='Maximum number of views to use per model (default: use all available views)')
+    
     # Basic configuration
     parser.add_argument('--dataset-path', type=str, required=True,
                         help='Path to the generated MVCNN dataset')
@@ -298,12 +302,13 @@ class MotionMVCNNDataset(Dataset):
     """Motion-Enhanced Multi-View CNN Dataset"""
     printed_view_count = False  # Class variable to control printing
 
-    def __init__(self, dataset_path, split='train', transform=None, selected_classes=None, compute_flow=True):
+    def __init__(self, dataset_path, split='train', transform=None, selected_classes=None, compute_flow=True, max_views=None):
         self.dataset_path = dataset_path
         self.split = split
         self.transform = transform
         self.selected_classes = selected_classes
         self.compute_flow = compute_flow
+        self.max_views = max_views
         
         # Path to renders directory
         self.renders_path = os.path.join(dataset_path, 'renders')
@@ -351,6 +356,10 @@ class MotionMVCNNDataset(Dataset):
                 for view in sorted(model_metadata['views'], key=lambda x: x['view_idx']):
                     view_files.append(os.path.join(model_path, view['filename']))
                 
+                # Limit the number of views if specified
+                if self.max_views is not None:
+                    view_files = view_files[:self.max_views]
+                    
                 self.samples.append({
                     'class_name': class_name,
                     'class_idx': class_idx,
@@ -535,9 +544,9 @@ def main():
     # Create datasets
     compute_flow = args.motion_mode == 'static'
     train_dataset = MotionMVCNNDataset(args.dataset_path, split='train', transform=train_transform, 
-                                      selected_classes=selected_classes, compute_flow=compute_flow)
+                                      selected_classes=selected_classes, compute_flow=compute_flow, max_views=args.max_views)
     test_dataset = MotionMVCNNDataset(args.dataset_path, split='test', transform=test_transform,
-                                     selected_classes=selected_classes, compute_flow=compute_flow)
+                                     selected_classes=selected_classes, compute_flow=compute_flow, max_views=args.max_views)
     
     # Create data loaders
     use_pin_memory = torch.cuda.is_available() and args.device == 'cuda'
