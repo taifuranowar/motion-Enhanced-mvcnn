@@ -45,6 +45,14 @@ class MotionEnhancedMVCNN(nn.Module):
         # Lightweight flow estimator (learnable, end-to-end)
         self.flow_net = SimpleFlowNet(in_channels=6, out_channels=2)
 
+        # Visibility mask head (learns soft masks for two warped features)
+        self.visibility_head = nn.Sequential(
+            nn.Conv2d(FEATURE_DIM * 2, 64, 3, padding=1),
+            nn.ReLU(),
+            nn.Conv2d(64, 2, 3, padding=1),
+            nn.Sigmoid()  # outputs values in [0,1]
+        )
+
         # Occlusion handling and refinement module
         self.occlusion_handler = nn.Sequential(
             nn.Conv2d(FEATURE_DIM * 2 + 2, 512, 3, padding=1),
@@ -178,29 +186,28 @@ class MotionEnhancedMVCNN(nn.Module):
 
         # 4) warp for the predicted views
         for vid in pred_indices:
-            # find nearest before/after refs
             before = max([r for r in ref_indices if r < vid], default=None)
             after  = min([r for r in ref_indices if r > vid], default=None)
 
-            warped_list, mask_list = [], []
+            warped_list = []
             for r in (before, after):
                 if r is None: continue
                 mv      = motion_vectors[:, r, vid]      # (B,H,W,2)
                 ref_f   = all_feats[:, r].unsqueeze(1)   # (B,1,D,fh,fw)
                 warped  = self.warp_features(ref_f, mv)  # (B,1,D,fh,fw)
-
-                # simple occlusion mask
-                occ_m   = (mv.norm(dim=-1) < 20.0).unsqueeze(1).float()  # (B,1,fh,fw)
                 warped_list.append(warped)
-                mask_list.append(occ_m)
 
             if len(warped_list) == 2:
-                feats_cat = torch.cat(warped_list, dim=1)  # (B,2,D,fh,fw)
-                masks_cat = torch.cat(mask_list,  dim=1)   # (B,2,fh,fw)
-                combine   = torch.cat([
-                    feats_cat.view(B, -1, fh, fw), masks_cat
-                ], dim=1)                               # (B,2D+2,fh,fw)
-                refined   = self.occlusion_handler(combine)
+                feats_cat  = torch.cat(warped_list, dim=1)      # (B,2,D,fh,fw)
+                B_, _, D_, fh_, fw_ = feats_cat.shape
+                feats_flat = feats_cat.view(B_, 2*D_, fh_, fw_)  # (B,2D,fh,fw)
+
+                # Predict two soft-masks
+                vis_masks  = self.visibility_head(feats_flat)    # (B,2,fh,fw)
+
+                # Concatenate feats and masks, then refine
+                combine    = torch.cat([feats_flat, vis_masks], dim=1)  # (B,2D+2,fh,fw)
+                refined    = self.occlusion_handler(combine)            # (B, D, fh, fw)
                 all_feats[:, vid] = refined
 
         # 5) pool & classify
