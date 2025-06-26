@@ -38,180 +38,157 @@ class MotionEnhancedMVCNN(nn.Module):
         super().__init__()
         self.motion_threshold = motion_threshold
 
-        # Base feature extractor (shared weights)
-        self.base_cnn = resnet18(pretrained=True)
-        self.base_cnn = nn.Sequential(*list(self.base_cnn.children())[:-2])  # Remove avgpool and fc
+        # 1) Split ResNet-18 into explicit blocks
+        resnet = resnet18(pretrained=True)
+        self.conv1   = nn.Sequential(resnet.conv1, resnet.bn1, resnet.relu, resnet.maxpool)
+        self.layer1  = resnet.layer1
+        self.layer2  = resnet.layer2   # ⇒ coarse features (B,128,H/8,W/8)
+        self.layer3  = resnet.layer3
+        self.layer4  = resnet.layer4   # ⇒ fine features   (B,512,H/32,W/32)
 
-        # Lightweight flow estimator (learnable, end-to-end)
-        self.flow_net = SimpleFlowNet(in_channels=6, out_channels=2)
-
-        # Visibility mask head (learns soft masks for two warped features)
-        self.visibility_head = nn.Sequential(
-            nn.Conv2d(FEATURE_DIM * 2, 64, 3, padding=1),
-            nn.ReLU(),
-            nn.Conv2d(64, 2, 3, padding=1),
-            nn.Sigmoid()  # outputs values in [0,1]
+        # 2) Occlusion/refinement at both scales
+        self.occl_s1 = nn.Sequential(
+            nn.Conv2d(128*2 + 2, 256, 3, padding=1), nn.ReLU(),
+            nn.Conv2d(256, 128, 3, padding=1),      nn.ReLU()
+        )
+        self.occl_s2 = nn.Sequential(
+            nn.Conv2d(512*2 + 2, 512, 3, padding=1), nn.ReLU(),
+            nn.Conv2d(512, 512, 3, padding=1),      nn.ReLU()
         )
 
-        # Occlusion handling and refinement module
-        self.occlusion_handler = nn.Sequential(
-            nn.Conv2d(FEATURE_DIM * 2 + 2, 512, 3, padding=1),
-            nn.ReLU(),
-            nn.Conv2d(512, FEATURE_DIM, 3, padding=1),
-            nn.ReLU()
-        )
-
-        # Classifier
+        # 3) Final classifier now takes (128+512)-dim global feature
         self.classifier = nn.Sequential(
-            nn.AdaptiveAvgPool2d(1),
-            nn.Flatten(),
-            nn.Linear(FEATURE_DIM, 256),
-            nn.ReLU(),
+            nn.AdaptiveAvgPool2d(1), nn.Flatten(),
+            nn.Linear(128+512, 256), nn.ReLU(),
             nn.Linear(256, num_classes)
         )
 
-    def dynamic_view_schedule(self, motion_vectors):
-        """
-        Greedy algorithm: start at view 0, 
-        then whenever avg motion from last_ref to i > threshold, mark i as new reference.
-        Always include the last view.
-        Args:
-            motion_vectors: (B, N, N, H, W, 2)
-        Returns:
-            ref_indices: list of ints
-        """
-        B, N, _, H, W, _ = motion_vectors.shape
-        ref_indices = [0]
-        last = 0
-
-        # Precompute mean motion mags from each last->i
-        mv = motion_vectors  # alias
-        mag = mv.norm(dim=-1)            # (B,N,N,H,W)
-        mag = mag.mean(dim=[0,2,3,4])    # (N,)  mean over B, dest-view index, H, W
-
-        for i in range(1, N-1):
-            if mag[last, i] > self.motion_threshold:
-                ref_indices.append(i)
-                last = i
-
-        # always include final view
-        if ref_indices[-1] != N-1:
-            ref_indices.append(N-1)
-
-        return ref_indices
+    def extract_scales(self, x):
+        """Run x through ResNet up to layer2 (coarse) and layer4 (fine)."""
+        x  = self.conv1(x)
+        x  = self.layer1(x)
+        s1 = self.layer2(x)   # (B,128,H/8,W/8)
+        x  = self.layer3(s1)
+        s2 = self.layer4(x)   # (B,512,H/32,W/32)
+        return s1, s2
 
     def get_reference_views(self, all_views, ref_indices):
-        """
-        Args:
-            all_views: (B,N,C,H,W)
-            ref_indices: list of ints
-        Returns:
-            ref_feats: (B, len(ref_indices), FEATURE_DIM, h, w)
-        """
-        B, N, C, H, W = all_views.shape
-        refs = all_views[:, ref_indices]              # (B, R, C, H, W)
-        flat  = refs.reshape(-1, C, H, W)             # (B*R, C, H, W)
-        feats = self.base_cnn(flat)                   # (B*R, D, h, w)
-        D, h, w = feats.shape[1:]
-        return feats.view(B, -1, D, h, w)
-
-    def estimate_motion(self, views):
-        """
-        Estimate motion fields between all pairs of views using the learnable flow_net.
-        Args:
-            views: (B, N, C, H, W)
-        Returns:
-            motion_vectors: (B, N, N, H, W, 2)
-        """
-        B, N, C, H, W = views.shape
-        device = views.device
-        motion_vectors = torch.zeros(B, N, N, H, W, 2, device=device)
-        for i in range(N):
-            img_i = views[:, i]  # (B, C, H, W)
-            for j in range(N):
-                if i == j:
-                    continue
-                img_j = views[:, j]
-                flow = self.flow_net(img_i, img_j)  # (B, 2, H, W)
-                motion_vectors[:, i, j] = flow.permute(0, 2, 3, 1)  # (B, H, W, 2)
-        return motion_vectors
+        B,N,C,H,W = all_views.shape
+        # pull out the reference images
+        flat = all_views[:, ref_indices].reshape(-1,C,H,W)
+        # get multi-scale feats
+        f1,f2 = self.extract_scales(flat)  
+        # reshape back: (B, R, C1, h1, w1) & (B, R, C2, h2, w2)
+        _,C1,h1,w1 = f1.shape
+        _,C2,h2,w2 = f2.shape
+        f1 = f1.view(B, -1, C1, h1, w1)
+        f2 = f2.view(B, -1, C2, h2, w2)
+        return f1, f2
 
     def warp_features(self, ref_features, motion_vectors):
-        """Warp reference features using motion vectors"""
-        batch_size, num_refs, feat_dim, feat_h, feat_w = ref_features.shape
-
-        # Create sampling grid from motion vectors
-        B, H, W, _ = motion_vectors.shape
-        grid_y, grid_x = torch.meshgrid(torch.arange(H, device=motion_vectors.device), torch.arange(W, device=motion_vectors.device), indexing='ij')
-        grid = torch.stack((grid_x, grid_y), dim=-1).float()  # (H, W, 2)
-        grid = grid.unsqueeze(0).repeat(B, 1, 1, 1)  # (B, H, W, 2)
-
-        # Apply motion vectors and normalize to [-1, 1]
-        wh = torch.tensor([W, H], dtype=torch.float32, device=motion_vectors.device)
-        warped_grid = (grid + motion_vectors) * 2.0 / wh - 1.0  # (B, H, W, 2)
-
-        # grid_sample expects (B, C, H, W) and grid (B, H, W, 2)
-        warped_features = F.grid_sample(
-            ref_features.view(-1, feat_dim, feat_h, feat_w),
+        """
+        ref_features: (B, 1, C, h, w)
+        motion_vectors: (B, h, w, 2)
+        Returns: (B, 1, C, h, w)
+        """
+        B, one, C, h, w = ref_features.shape
+        grid_y, grid_x = torch.meshgrid(
+            torch.arange(h, device=motion_vectors.device),
+            torch.arange(w, device=motion_vectors.device),
+            indexing='ij'
+        )
+        grid = torch.stack((grid_x, grid_y), dim=-1).float()  # (h, w, 2)
+        grid = grid.unsqueeze(0).repeat(B, 1, 1, 1)  # (B, h, w, 2)
+        wh = torch.tensor([w, h], dtype=torch.float32, device=motion_vectors.device)
+        warped_grid = (grid + motion_vectors) * 2.0 / wh - 1.0  # (B, h, w, 2)
+        warped = F.grid_sample(
+            ref_features.view(B, C, h, w),
             warped_grid,
             mode='bilinear',
             padding_mode='zeros',
             align_corners=True
         )
-        return warped_features.view(batch_size, -1, feat_dim, feat_h, feat_w)
+        return warped.view(B, 1, C, h, w)
 
-    def forward(self, views, motion_vectors=None):
-        """
-        views:            (B, N, C, H, W)
-        motion_vectors:   (B, N, N, H, W, 2) or None
-        """
-        B, N, C, H, W = views.shape
+    def dynamic_view_schedule(self, motion_vectors):
+        B, N, _, H, W, _ = motion_vectors.shape
+        ref_indices = [0]
+        last = 0
+        mv = motion_vectors
+        mag = mv.norm(dim=-1)
+        mag = mag.mean(dim=[0,2,3,4])
+        for i in range(1, N-1):
+            if mag[last, i] > self.motion_threshold:
+                ref_indices.append(i)
+                last = i
+        if ref_indices[-1] != N-1:
+            ref_indices.append(N-1)
+        return ref_indices
 
-        # If motion_vectors not provided, estimate them with the learnable flow_net
-        if motion_vectors is None:
-            motion_vectors = self.estimate_motion(views)  # (B, N, N, H, W, 2)
+    def forward(self, views, motion_vectors):
+        B,N,_,H,W = views.shape
 
-        # 1) pick refs dynamically
-        ref_indices  = self.dynamic_view_schedule(motion_vectors)
-        pred_indices = [i for i in range(N) if i not in ref_indices]
+        # dynamic scheduler stays the same…
+        ref_idxs = self.dynamic_view_schedule(motion_vectors)
+        pred_idxs= [i for i in range(N) if i not in ref_idxs]
 
-        # 2) extract ref features
-        ref_feats = self.get_reference_views(views, ref_indices)
-        _, R, D, fh, fw = ref_feats.shape
+        # 1) extract and stash ref features at both scales
+        ref1, ref2 = self.get_reference_views(views, ref_idxs)
+        _,R,C1,h1,w1 = ref1.shape
+        _,_,C2,h2,w2 = ref2.shape
 
-        # 3) build feature table
-        all_feats = views.new_zeros(B, N, D, fh, fw)
-        for ridx, vid in enumerate(ref_indices):
-            all_feats[:, vid] = ref_feats[:, ridx]
+        all1 = views.new_zeros(B, N, C1, h1, w1)
+        all2 = views.new_zeros(B, N, C2, h2, w2)
+        for i,vid in enumerate(ref_idxs):
+            all1[:,vid] = ref1[:,i]
+            all2[:,vid] = ref2[:,i]
 
-        # 4) warp for the predicted views
-        for vid in pred_indices:
-            before = max([r for r in ref_indices if r < vid], default=None)
-            after  = min([r for r in ref_indices if r > vid], default=None)
-
-            warped_list = []
-            for r in (before, after):
+        # 2) for each predicted view, warp & refine at both scales
+        for vid in pred_idxs:
+            bef = max([r for r in ref_idxs if r<vid], default=None)
+            aft = min([r for r in ref_idxs if r>vid], default=None)
+            warps1, masks1, warps2, masks2 = [], [], [], []
+            for r in (bef,aft):
                 if r is None: continue
-                mv      = motion_vectors[:, r, vid]      # (B,H,W,2)
-                ref_f   = all_feats[:, r].unsqueeze(1)   # (B,1,D,fh,fw)
-                warped  = self.warp_features(ref_f, mv)  # (B,1,D,fh,fw)
-                warped_list.append(warped)
 
-            if len(warped_list) == 2:
-                feats_cat  = torch.cat(warped_list, dim=1)      # (B,2,D,fh,fw)
-                B_, _, D_, fh_, fw_ = feats_cat.shape
-                feats_flat = feats_cat.view(B_, 2*D_, fh_, fw_)  # (B,2D,fh,fw)
+                # downsample motion to coarse / fine grids
+                mv     = motion_vectors[:,r,vid]                          # (B,H,W,2)
+                mv_s1  = F.interpolate(mv.permute(0,3,1,2), size=(h1,w1),
+                                       mode='bilinear', align_corners=True
+                                      ).permute(0,2,3,1)
+                mv_s2  = F.interpolate(mv.permute(0,3,1,2), size=(h2,w2),
+                                       mode='bilinear', align_corners=True
+                                      ).permute(0,2,3,1)
 
-                # Predict two soft-masks
-                vis_masks  = self.visibility_head(feats_flat)    # (B,2,fh,fw)
+                # warp
+                ref_f1 = all1[:,r].unsqueeze(1)    # (B,1,C1,h1,w1)
+                ref_f2 = all2[:,r].unsqueeze(1)    # (B,1,C2,h2,w2)
+                w1_   = self.warp_features(ref_f1, mv_s1)
+                w2_   = self.warp_features(ref_f2, mv_s2)
 
-                # Concatenate feats and masks, then refine
-                combine    = torch.cat([feats_flat, vis_masks], dim=1)  # (B,2D+2,fh,fw)
-                refined    = self.occlusion_handler(combine)            # (B, D, fh, fw)
-                all_feats[:, vid] = refined
+                # simple occlusion masks
+                occ1  = (mv_s1.norm(dim=-1)<self.motion_threshold).unsqueeze(1)
+                occ2  = (mv_s2.norm(dim=-1)<self.motion_threshold).unsqueeze(1)
 
-        # 5) pool & classify
-        global_feat, _ = all_feats.max(dim=1)
+                warps1.append(w1_); masks1.append(occ1)
+                warps2.append(w2_); masks2.append(occ2)
+
+            if len(warps1)==2:
+                # refine coarse
+                f1_cat = torch.cat(warps1,dim=1).view(B,2*C1,h1,w1)
+                m1_cat = torch.cat(masks1,dim=1)
+                all1[:,vid] = self.occl_s1(torch.cat([f1_cat,m1_cat],dim=1))
+
+                # refine fine
+                f2_cat = torch.cat(warps2,dim=1).view(B,2*C2,h2,w2)
+                m2_cat = torch.cat(masks2,dim=1)
+                all2[:,vid] = self.occl_s2(torch.cat([f2_cat,m2_cat],dim=1))
+
+        # 3) fuse scales & classify
+        up1    = F.interpolate(all1, size=(h2,w2),
+                               mode='bilinear', align_corners=True)
+        fused  = torch.cat([up1, all2], dim=2)    # (B,N,C1+C2,h2,w2)
+        global_feat,_ = fused.max(dim=1)          # (B,C1+C2,h2,w2)
         return self.classifier(global_feat)
 
 class ModelNetMotionDataset(Dataset):
