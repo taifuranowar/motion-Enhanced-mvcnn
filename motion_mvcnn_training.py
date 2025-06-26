@@ -1,21 +1,69 @@
+import os
 import torch
 import torch.nn as nn
 import torch.optim as optim
 import torch.nn.functional as F
+import torchvision.transforms as transforms
 from torch.utils.data import Dataset, DataLoader
 from torchvision.models import resnet18
+import json
+import argparse
 import numpy as np
+from PIL import Image
 import cv2
+import matplotlib.pyplot as plt
+from datetime import datetime
+from sklearn.metrics import confusion_matrix, classification_report
+import seaborn as sns
 
-# Configuration
-NUM_VIEWS = 12
-REF_VIEW_STRIDE = 4  # Not used in dynamic scheduling, kept for compatibility
-FEATURE_DIM = 512
-NUM_CLASSES = 40  # ModelNet40 classes
-BATCH_SIZE = 32
-EPOCHS = 50
-LEARNING_RATE = 0.001
+# ========== Command Line Arguments ==========
+def parse_args():
+    parser = argparse.ArgumentParser(description='Motion Enhanced MVCNN Training')
+    
+    # Basic configuration
+    parser.add_argument('--dataset-path', type=str, required=True,
+                        help='Path to the generated MVCNN dataset')
+    parser.add_argument('--output-dir', type=str, default='motion_mvcnn_results',
+                        help='Output directory for trained model and results')
+    
+    # Training parameters
+    parser.add_argument('--batch-size', type=int, default=8,
+                        help='Batch size for training')
+    parser.add_argument('--epochs', type=int, default=30,
+                        help='Number of epochs to train')
+    parser.add_argument('--lr', type=float, default=0.0001,
+                        help='Learning rate')
+    parser.add_argument('--weight-decay', type=float, default=0.0001,
+                        help='Weight decay for optimizer')
+    parser.add_argument('--use-pretrained', action='store_true',
+                        help='Use pretrained weights for the backbone')
+    parser.add_argument('--num-workers', type=int, default=4,
+                        help='Number of data loading workers')
+    parser.add_argument('--device', type=str, default='cuda',
+                        help='Device to use (cuda or cpu)')
+    
+    # Model parameters
+    parser.add_argument('--motion-threshold', type=float, default=0.05,
+                        help='Threshold for motion-based view scheduling')
+    parser.add_argument('--dropout', type=float, default=0.5,
+                        help='Dropout rate for fully connected layers')
 
+    # Class selection
+    parser.add_argument('--selected-classes', type=str, default=None,
+                        help='Comma-separated list of class names to use (e.g. "chair,table,sofa,bed,car")')
+    parser.add_argument('--num-classes', type=int, default=None,
+                        help='Number of classes to use for training (selects first N classes, optionally from selected-classes)')
+    
+    # Save/load parameters
+    parser.add_argument('--save-freq', type=int, default=5,
+                        help='Save model every N epochs')
+    parser.add_argument('--resume', type=str, default=None,
+                        help='Path to checkpoint to resume from')
+    
+    args = parser.parse_args()
+    return args
+
+# ========== SimpleFlowNet ==========
 class SimpleFlowNet(nn.Module):
     """A lightweight flow estimator for demonstration (not accurate, but differentiable)."""
     def __init__(self, in_channels=6, out_channels=2):
@@ -33,8 +81,9 @@ class SimpleFlowNet(nn.Module):
         x = torch.cat([img1, img2], dim=1)
         return self.net(x)  # (B, 2, H, W)
 
+# ========== Motion Enhanced MVCNN Model ==========
 class MotionEnhancedMVCNN(nn.Module):
-    def __init__(self, num_classes=NUM_CLASSES, motion_threshold=0.05):
+    def __init__(self, num_classes=40, motion_threshold=0.05):
         super().__init__()
         self.motion_threshold = motion_threshold
 
@@ -111,6 +160,15 @@ class MotionEnhancedMVCNN(nn.Module):
         return warped.view(B, 1, C, h, w)
 
     def dynamic_view_schedule(self, motion_vectors):
+        """
+        Greedy algorithm: start at view 0, 
+        then whenever avg motion from last_ref to i > threshold, mark i as new reference.
+        Always include the last view.
+        Args:
+            motion_vectors: (B, N, N, H, W, 2)
+        Returns:
+            ref_indices: list of ints
+        """
         B, N, _, H, W, _ = motion_vectors.shape
         ref_indices = [0]
         last = 0
@@ -125,8 +183,28 @@ class MotionEnhancedMVCNN(nn.Module):
             ref_indices.append(N-1)
         return ref_indices
 
-    def forward(self, views, motion_vectors):
-        B,N,_,H,W = views.shape
+    def estimate_motion(self, views):
+        """Estimate optical flow between all pairs of views"""
+        B, N, C, H, W = views.shape
+        motion_vectors = torch.zeros(B, N, N, H, W, 2, device=views.device)
+        for i in range(N):
+            for j in range(N):
+                if i == j:
+                    continue
+                # Simple approximation using scaled coordinate differences
+                # In a real implementation, use optical flow or learned flow
+                flow_x = torch.zeros((B, H, W), device=views.device)
+                flow_y = torch.zeros((B, H, W), device=views.device)
+                motion_vectors[:, i, j, :, :, 0] = flow_x
+                motion_vectors[:, i, j, :, :, 1] = flow_y
+        return motion_vectors
+
+    def forward(self, views, motion_vectors=None):
+        B, N, C, H, W = views.shape
+
+        # Estimate motion if not provided
+        if motion_vectors is None:
+            motion_vectors = self.estimate_motion(views)
 
         # dynamic scheduler stays the same…
         ref_idxs = self.dynamic_view_schedule(motion_vectors)
@@ -191,118 +269,465 @@ class MotionEnhancedMVCNN(nn.Module):
         global_feat,_ = fused.max(dim=1)          # (B,C1+C2,h2,w2)
         return self.classifier(global_feat)
 
-class ModelNetMotionDataset(Dataset):
-    def __init__(self, root_dir, split='train'):
-        self.root_dir = root_dir
+# ========== Dataset Handling ==========
+class MotionMVCNNDataset(Dataset):
+    """Motion-Enhanced Multi-View CNN Dataset"""
+    def __init__(self, dataset_path, split='train', transform=None, selected_classes=None, compute_flow=True):
+        self.dataset_path = dataset_path
         self.split = split
-        self.samples = []  # List of (obj_id, class_id)
+        self.transform = transform
+        self.selected_classes = selected_classes
+        self.compute_flow = compute_flow
         
-        # Populate samples (implementation depends on dataset structure)
-        # For demo, leave as empty or implement as needed.
+        # Path to renders directory
+        self.renders_path = os.path.join(dataset_path, 'renders')
+        
+        # Load dataset metadata
+        with open(os.path.join(dataset_path, 'dataset_metadata.json'), 'r') as f:
+            self.metadata = json.load(f)
+        
+        self.classes = []
+        self.class_to_idx = {}
+        
+        # Build class list and mapping
+        for idx, class_data in enumerate(self.metadata['classes']):
+            class_name = class_data['class_name']
+            if self.selected_classes is not None and class_name not in self.selected_classes:
+                continue
+            self.classes.append(class_name)
+            self.class_to_idx[class_name] = len(self.classes) - 1
+        
+        self.samples = []
+        
+        # Build dataset samples list
+        for class_data in self.metadata['classes']:
+            class_name = class_data['class_name']
+            if self.selected_classes is not None and class_name not in self.selected_classes:
+                continue
+            class_idx = self.class_to_idx[class_name]
+            
+            # Select models based on split
+            if split == 'train':
+                models_data = class_data['train_models']
+            else:  # test or val
+                models_data = class_data['test_models']
+            
+            for model_data in models_data:
+                model_name = model_data['model_name']
+                model_path = os.path.join(self.renders_path, class_name, split, model_name)
+                
+                # Load model metadata to get view information
+                with open(os.path.join(model_path, 'metadata.json'), 'r') as f:
+                    model_metadata = json.load(f)
+                
+                # Get view filenames sorted by view_idx
+                view_files = []
+                for view in sorted(model_metadata['views'], key=lambda x: x['view_idx']):
+                    view_files.append(os.path.join(model_path, view['filename']))
+                
+                self.samples.append({
+                    'class_name': class_name,
+                    'class_idx': class_idx,
+                    'model_name': model_name,
+                    'view_files': view_files
+                })
     
     def __len__(self):
         return len(self.samples)
     
     def __getitem__(self, idx):
-        obj_id, class_id = self.samples[idx]
+        sample = self.samples[idx]
         
-        # Load multi-view images
+        # Load all views for this model
         views = []
-        for i in range(NUM_VIEWS):
-            img_path = f"{self.root_dir}/{obj_id}/view_{i:02d}.png"
-            img = cv2.imread(img_path)
-            img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
-            img = img.transpose(2, 0, 1).astype(np.float32) / 255.0
+        raw_views = []  # Keep originals for flow computation
+        for view_file in sample['view_files']:
+            img = Image.open(view_file).convert('RGB')
+            raw_views.append(np.array(img))
+            if self.transform:
+                img = self.transform(img)
             views.append(img)
-        views = np.stack(views)
         
-        # Load precomputed motion vectors (for demo: using zeros)
-        motion_vectors = np.zeros((NUM_VIEWS, NUM_VIEWS, views.shape[2], views.shape[3], 2), dtype=np.float32)
+        # Stack views into a tensor [num_views, channels, height, width]
+        views = torch.stack(views)
         
-        # Example: If you want to compute optical flow, you need two images (not implemented here)
-        # for i in range(NUM_VIEWS):
-        #     for j in range(NUM_VIEWS):
-        #         if i != j:
-        #             flow = cv2.calcOpticalFlowFarneback(
-        #                 cv2.cvtColor(views[i].transpose(1,2,0), cv2.COLOR_RGB2GRAY),
-        #                 cv2.cvtColor(views[j].transpose(1,2,0), cv2.COLOR_RGB2GRAY),
-        #                 None, 0.5, 3, 15, 3, 5, 1.2, 0
-        #             )
-        #             motion_vectors[i, j] = flow
+        # Create empty motion vectors tensor
+        num_views = len(views)
+        
+        # Structure for motion vectors: [num_views, num_views, H, W, 2]
+        motion_vectors = torch.zeros(num_views, num_views, views.shape[2], views.shape[3], 2)
+        
+        # Compute optical flow between views if requested
+        if self.compute_flow:
+            for i in range(num_views):
+                img_i = raw_views[i]
+                img_i_gray = cv2.cvtColor(img_i, cv2.COLOR_RGB2GRAY)
+                
+                for j in range(num_views):
+                    if i != j:
+                        img_j = raw_views[j]
+                        img_j_gray = cv2.cvtColor(img_j, cv2.COLOR_RGB2GRAY)
+                        
+                        # Calculate optical flow
+                        flow = cv2.calcOpticalFlowFarneback(
+                            img_i_gray, img_j_gray, None, 
+                            0.5, 3, 15, 3, 5, 1.2, 0
+                        )
+                        
+                        # Resize flow to match transformed image size
+                        flow = cv2.resize(flow, (views.shape[2], views.shape[3]))
+                        motion_vectors[i, j] = torch.from_numpy(flow).float()
         
         return {
-            'views': torch.tensor(views, dtype=torch.float32),
-            'motion_vectors': torch.tensor(motion_vectors, dtype=torch.float32),
-            'label': class_id
+            'views': views,
+            'motion_vectors': motion_vectors,
+            'label': sample['class_idx'],
+            'class_name': sample['class_name'],
+            'model_name': sample['model_name']
         }
 
-def main():
-    # Initialize dataset and dataloader
-    train_dataset = ModelNetMotionDataset('path/to/modelnet_motion', 'train')
-    val_dataset = ModelNetMotionDataset('path/to/modelnet_motion', 'val')
+# ========== Training and Evaluation Functions ==========
+def train_one_epoch(model, dataloader, criterion, optimizer, device):
+    model.train()
+    running_loss = 0.0
+    correct = 0
+    total = 0
     
-    train_loader = DataLoader(train_dataset, batch_size=BATCH_SIZE, shuffle=True)
-    val_loader = DataLoader(val_dataset, batch_size=BATCH_SIZE, shuffle=False)
-    
-    # Initialize model
-    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    model = MotionEnhancedMVCNN().to(device)
-    
-    # Loss and optimizer
-    criterion = nn.CrossEntropyLoss()
-    optimizer = optim.Adam(model.parameters(), lr=LEARNING_RATE)
-    scheduler = optim.lr_scheduler.StepLR(optimizer, step_size=20, gamma=0.1)
-    
-    # Training loop
-    for epoch in range(EPOCHS):
-        model.train()
-        running_loss = 0.0
+    for batch_idx, data in enumerate(dataloader):
+        views = data['views'].to(device)
+        motion_vectors = data['motion_vectors'].to(device)
+        labels = data['label'].to(device)
         
-        for batch in train_loader:
-            views = batch['views'].to(device)
-            motion_vectors = batch['motion_vectors'].to(device)
-            labels = batch['label'].to(device)
-            
-            optimizer.zero_grad()
+        optimizer.zero_grad()
+        
+        outputs = model(views, motion_vectors)
+        loss = criterion(outputs, labels)
+        
+        loss.backward()
+        optimizer.step()
+        
+        running_loss += loss.item()
+        
+        _, predicted = outputs.max(1)
+        total += labels.size(0)
+        correct += predicted.eq(labels).sum().item()
+        
+        # Print progress
+        if (batch_idx + 1) % 10 == 0:
+            print(f'Batch: {batch_idx+1}/{len(dataloader)} | Loss: {loss.item():.4f} | ' +
+                  f'Acc: {100 * correct / total:.2f}% ({correct}/{total})')
+    
+    epoch_loss = running_loss / len(dataloader)
+    epoch_acc = 100 * correct / total
+    
+    return epoch_loss, epoch_acc
+
+def evaluate(model, dataloader, criterion, device):
+    model.eval()
+    running_loss = 0.0
+    correct = 0
+    total = 0
+    
+    all_preds = []
+    all_labels = []
+    class_correct = {}
+    class_total = {}
+    
+    with torch.no_grad():
+        for batch_idx, data in enumerate(dataloader):
+            views = data['views'].to(device)
+            motion_vectors = data['motion_vectors'].to(device)
+            labels = data['label'].to(device)
             
             outputs = model(views, motion_vectors)
             loss = criterion(outputs, labels)
-            loss.backward()
-            optimizer.step()
             
             running_loss += loss.item()
-        
-        # Validation
-        model.eval()
-        val_loss = 0.0
-        correct = 0
-        total = 0
-        
-        with torch.no_grad():
-            for batch in val_loader:
-                views = batch['views'].to(device)
-                motion_vectors = batch['motion_vectors'].to(device)
-                labels = batch['label'].to(device)
-                
-                outputs = model(views, motion_vectors)
-                loss = criterion(outputs, labels)
-                
-                val_loss += loss.item()
-                _, predicted = outputs.max(1)
-                total += labels.size(0)
-                correct += predicted.eq(labels).sum().item()
-        
-        # Print statistics
-        train_loss = running_loss / len(train_loader) if len(train_loader) > 0 else 0
-        val_acc = 100. * correct / total if total > 0 else 0
-        
-        print(f"Epoch {epoch+1}/{EPOCHS}: "
-              f"Train Loss: {train_loss:.4f} | "
-              f"Val Acc: {val_acc:.2f}%")
-        
-        scheduler.step()
+            
+            _, predicted = outputs.max(1)
+            total += labels.size(0)
+            correct += predicted.eq(labels).sum().item()
+            
+            # Track per-class accuracy
+            for i in range(labels.size(0)):
+                label = labels[i].item()
+                pred = predicted[i].item()
+                if label not in class_correct:
+                    class_correct[label] = 0
+                    class_total[label] = 0
+                class_total[label] += 1
+                if label == pred:
+                    class_correct[label] += 1
+            
+            # Track predictions and labels for confusion matrix
+            all_preds.extend(predicted.cpu().numpy())
+            all_labels.extend(labels.cpu().numpy())
     
-    print("Training complete")
+    # Calculate loss and accuracy
+    epoch_loss = running_loss / len(dataloader)
+    epoch_acc = 100 * correct / total
+    
+    # Calculate per-class accuracy
+    class_acc = {}
+    for label in class_total:
+        class_acc[label] = 100 * class_correct[label] / class_total[label]
+    
+    return {
+        'loss': epoch_loss,
+        'accuracy': epoch_acc,
+        'class_accuracy': class_acc,
+        'predictions': all_preds,
+        'labels': all_labels
+    }
 
-if __name__ == "__main__":
+# ========== Main Function ==========
+def main():
+    args = parse_args()
+
+    # Parse selected classes if provided
+    selected_classes = None
+    if args.selected_classes is not None:
+        selected_classes = [c.strip() for c in args.selected_classes.split(',') if c.strip()]
+    else:
+        # If not provided, get all classes from metadata
+        with open(os.path.join(args.dataset_path, 'dataset_metadata.json'), 'r') as f:
+            metadata = json.load(f)
+        selected_classes = [c['class_name'] for c in metadata['classes']]
+
+    # Apply num-classes if specified
+    if args.num_classes is not None:
+        selected_classes = selected_classes[:args.num_classes]
+    print(f"Selected classes: {selected_classes}")
+
+    # Create output directory
+    os.makedirs(args.output_dir, exist_ok=True)
+    
+    # Set device
+    device = torch.device(args.device if torch.cuda.is_available() and args.device == 'cuda' else 'cpu')
+    print(f"Using device: {device}")
+    
+    # Define transforms
+    train_transform = transforms.Compose([
+        transforms.RandomResizedCrop(224),
+        transforms.RandomHorizontalFlip(),
+        transforms.ColorJitter(brightness=0.1, contrast=0.1, saturation=0.1),
+        transforms.ToTensor(),
+        transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
+    ])
+    
+    test_transform = transforms.Compose([
+        transforms.Resize(256),
+        transforms.CenterCrop(224),
+        transforms.ToTensor(),
+        transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
+    ])
+    
+    # Create datasets
+    train_dataset = MotionMVCNNDataset(args.dataset_path, split='train', transform=train_transform, 
+                                      selected_classes=selected_classes)
+    test_dataset = MotionMVCNNDataset(args.dataset_path, split='test', transform=test_transform,
+                                     selected_classes=selected_classes)
+    
+    # Create data loaders
+    use_pin_memory = torch.cuda.is_available() and args.device == 'cuda'
+    train_loader = DataLoader(train_dataset, batch_size=args.batch_size, shuffle=True, 
+                             num_workers=args.num_workers, pin_memory=use_pin_memory)
+    test_loader = DataLoader(test_dataset, batch_size=args.batch_size, shuffle=False,
+                            num_workers=args.num_workers, pin_memory=use_pin_memory)
+    
+    print(f"Dataset loaded: {len(train_dataset)} training samples, {len(test_dataset)} test samples")
+    print(f"Classes: {len(train_dataset.classes)}")
+    
+    # Create model
+    model = MotionEnhancedMVCNN(num_classes=len(train_dataset.classes), 
+                              motion_threshold=args.motion_threshold)
+    
+    # Move model to device
+    model = model.to(device)
+    
+    # Loss function and optimizer
+    criterion = nn.CrossEntropyLoss()
+    optimizer = optim.Adam(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
+    
+    # Create scheduler (reduce LR on plateau)
+    scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='max', factor=0.5, patience=3)
+    
+    # Training history tracking
+    history = {
+        'train_loss': [],
+        'train_acc': [],
+        'val_loss': [],
+        'val_acc': [],
+        'best_acc': 0.0,
+        'best_epoch': 0
+    }
+    
+    # Resume from checkpoint if specified
+    start_epoch = 0
+    if args.resume:
+        if os.path.isfile(args.resume):
+            print(f"Loading checkpoint '{args.resume}'")
+            checkpoint = torch.load(args.resume)
+            start_epoch = checkpoint['epoch']
+            model.load_state_dict(checkpoint['model_state_dict'])
+            optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+            history = checkpoint['history']
+            print(f"Loaded checkpoint '{args.resume}' (epoch {checkpoint['epoch']})")
+        else:
+            print(f"No checkpoint found at '{args.resume}'")
+    
+    # Training loop
+    print("Starting training...")
+    for epoch in range(start_epoch, args.epochs):
+        print(f"\nEpoch {epoch+1}/{args.epochs}")
+        print('-' * 50)
+        
+        # Train one epoch
+        train_loss, train_acc = train_one_epoch(model, train_loader, criterion, optimizer, device)
+        
+        # Evaluate model
+        print("Evaluating...")
+        eval_results = evaluate(model, test_loader, criterion, device)
+        val_loss = eval_results['loss']
+        val_acc = eval_results['accuracy']
+        
+        # Update learning rate
+        scheduler.step(val_acc)
+        
+        # Update history
+        history['train_loss'].append(train_loss)
+        history['train_acc'].append(train_acc)
+        history['val_loss'].append(val_loss)
+        history['val_acc'].append(val_acc)
+        
+        # Print epoch results
+        print(f"Train Loss: {train_loss:.4f}, Train Acc: {train_acc:.2f}%")
+        print(f"Val Loss: {val_loss:.4f}, Val Acc: {val_acc:.2f}%")
+        
+        # Check if this is the best model
+        if val_acc > history['best_acc']:
+            history['best_acc'] = val_acc
+            history['best_epoch'] = epoch
+            
+            # Save best model
+            best_model_path = os.path.join(args.output_dir, 'best_model.pth')
+            torch.save({
+                'epoch': epoch,
+                'model_state_dict': model.state_dict(),
+                'optimizer_state_dict': optimizer.state_dict(),
+                'history': history,
+                'val_acc': val_acc,
+                'class_accuracy': eval_results['class_accuracy'],
+                'num_classes': len(train_dataset.classes),
+                'classes': train_dataset.classes,
+                'args': vars(args)
+            }, best_model_path)
+            print(f"New best model saved! Accuracy: {val_acc:.2f}%")
+        
+        # Save checkpoint every few epochs
+        if (epoch + 1) % args.save_freq == 0:
+            checkpoint_path = os.path.join(args.output_dir, f'checkpoint_epoch_{epoch+1}.pth')
+            torch.save({
+                'epoch': epoch,
+                'model_state_dict': model.state_dict(),
+                'optimizer_state_dict': optimizer.state_dict(),
+                'history': history,
+                'args': vars(args)
+            }, checkpoint_path)
+            print(f"Checkpoint saved at epoch {epoch+1}")
+    
+    # Final evaluation
+    print("\nTraining complete. Running final evaluation...")
+    final_results = evaluate(model, test_loader, criterion, device)
+    
+    # Save confusion matrix
+    conf_matrix = confusion_matrix(final_results['labels'], final_results['predictions'])
+    plt.figure(figsize=(12, 10))
+    sns.heatmap(conf_matrix, annot=True, fmt='d', cmap='Blues',
+                xticklabels=train_dataset.classes,
+                yticklabels=train_dataset.classes)
+    plt.xlabel('Predicted Labels')
+    plt.ylabel('True Labels')
+    plt.title('Confusion Matrix')
+    plt.tight_layout()
+    plt.savefig(os.path.join(args.output_dir, 'confusion_matrix.png'))
+    
+    # Generate classification report
+    class_report = classification_report(
+        final_results['labels'], 
+        final_results['predictions'],
+        target_names=train_dataset.classes,
+        output_dict=True
+    )
+    
+    # Save final metrics
+    metrics = {
+        'final_accuracy': final_results['accuracy'],
+        'best_accuracy': history['best_acc'],
+        'best_epoch': history['best_epoch'],
+        'class_accuracy': final_results['class_accuracy'],
+        'train_history': {
+            'loss': history['train_loss'],
+            'accuracy': history['train_acc']
+        },
+        'val_history': {
+            'loss': history['val_loss'],
+            'accuracy': history['val_acc']
+        },
+        'classification_report': class_report,
+        'confusion_matrix': conf_matrix.tolist(),
+        'classes': train_dataset.classes,
+        'timestamp': datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        'model_parameters': vars(args)
+    }
+    
+    # Save metrics to JSON
+    metrics_path = os.path.join(args.output_dir, 'metrics.json')
+    with open(metrics_path, 'w') as f:
+        json.dump(metrics, f, indent=2)
+    
+    # Save final model
+    final_model_path = os.path.join(args.output_dir, 'final_model.pth')
+    torch.save({
+        'epoch': args.epochs,
+        'model_state_dict': model.state_dict(),
+        'optimizer_state_dict': optimizer.state_dict(),
+        'history': history,
+        'final_acc': final_results['accuracy'],
+        'class_accuracy': final_results['class_accuracy'],
+        'num_classes': len(train_dataset.classes),
+        'classes': train_dataset.classes,
+        'args': vars(args)
+    }, final_model_path)
+    
+    # Plot loss and accuracy curves
+    plt.figure(figsize=(12, 5))
+    plt.subplot(1, 2, 1)
+    plt.plot(history['train_loss'], label='Train')
+    plt.plot(history['val_loss'], label='Validation')
+    plt.xlabel('Epoch')
+    plt.ylabel('Loss')
+    plt.title('Loss Curves')
+    plt.legend()
+    
+    plt.subplot(1, 2, 2)
+    plt.plot(history['train_acc'], label='Train')
+    plt.plot(history['val_acc'], label='Validation')
+    plt.xlabel('Epoch')
+    plt.ylabel('Accuracy (%)')
+    plt.title('Accuracy Curves')
+    plt.legend()
+    
+    plt.tight_layout()
+    plt.savefig(os.path.join(args.output_dir, 'training_curves.png'))
+    
+    # Print final results
+    print("\n" + "="*50)
+    print("TRAINING COMPLETE")
+    print("="*50)
+    print(f"Best validation accuracy: {history['best_acc']:.2f}% (epoch {history['best_epoch']+1})")
+    print(f"Final validation accuracy: {final_results['accuracy']:.2f}%")
+    print(f"Results saved to: {args.output_dir}")
+
+if __name__ == '__main__':
     main()
