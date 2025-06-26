@@ -16,6 +16,23 @@ BATCH_SIZE = 32
 EPOCHS = 50
 LEARNING_RATE = 0.001
 
+class SimpleFlowNet(nn.Module):
+    """A lightweight flow estimator for demonstration (not accurate, but differentiable)."""
+    def __init__(self, in_channels=6, out_channels=2):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Conv2d(in_channels, 32, 3, padding=1),
+            nn.ReLU(),
+            nn.Conv2d(32, 32, 3, padding=1),
+            nn.ReLU(),
+            nn.Conv2d(32, out_channels, 3, padding=1)
+        )
+
+    def forward(self, img1, img2):
+        # img1, img2: (B, C, H, W)
+        x = torch.cat([img1, img2], dim=1)
+        return self.net(x)  # (B, 2, H, W)
+
 class MotionEnhancedMVCNN(nn.Module):
     def __init__(self, num_classes=NUM_CLASSES, motion_threshold=0.05):
         super().__init__()
@@ -24,6 +41,9 @@ class MotionEnhancedMVCNN(nn.Module):
         # Base feature extractor (shared weights)
         self.base_cnn = resnet18(pretrained=True)
         self.base_cnn = nn.Sequential(*list(self.base_cnn.children())[:-2])  # Remove avgpool and fc
+
+        # Lightweight flow estimator (learnable, end-to-end)
+        self.flow_net = SimpleFlowNet(in_channels=6, out_channels=2)
 
         # Occlusion handling and refinement module
         self.occlusion_handler = nn.Sequential(
@@ -87,6 +107,27 @@ class MotionEnhancedMVCNN(nn.Module):
         D, h, w = feats.shape[1:]
         return feats.view(B, -1, D, h, w)
 
+    def estimate_motion(self, views):
+        """
+        Estimate motion fields between all pairs of views using the learnable flow_net.
+        Args:
+            views: (B, N, C, H, W)
+        Returns:
+            motion_vectors: (B, N, N, H, W, 2)
+        """
+        B, N, C, H, W = views.shape
+        device = views.device
+        motion_vectors = torch.zeros(B, N, N, H, W, 2, device=device)
+        for i in range(N):
+            img_i = views[:, i]  # (B, C, H, W)
+            for j in range(N):
+                if i == j:
+                    continue
+                img_j = views[:, j]
+                flow = self.flow_net(img_i, img_j)  # (B, 2, H, W)
+                motion_vectors[:, i, j] = flow.permute(0, 2, 3, 1)  # (B, H, W, 2)
+        return motion_vectors
+
     def warp_features(self, ref_features, motion_vectors):
         """Warp reference features using motion vectors"""
         batch_size, num_refs, feat_dim, feat_h, feat_w = ref_features.shape
@@ -111,12 +152,16 @@ class MotionEnhancedMVCNN(nn.Module):
         )
         return warped_features.view(batch_size, -1, feat_dim, feat_h, feat_w)
 
-    def forward(self, views, motion_vectors):
+    def forward(self, views, motion_vectors=None):
         """
         views:            (B, N, C, H, W)
-        motion_vectors:   (B, N, N, H, W, 2)
+        motion_vectors:   (B, N, N, H, W, 2) or None
         """
         B, N, C, H, W = views.shape
+
+        # If motion_vectors not provided, estimate them with the learnable flow_net
+        if motion_vectors is None:
+            motion_vectors = self.estimate_motion(views)  # (B, N, N, H, W, 2)
 
         # 1) pick refs dynamically
         ref_indices  = self.dynamic_view_schedule(motion_vectors)
