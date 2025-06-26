@@ -47,7 +47,9 @@ def parse_args():
                         help='Threshold for motion-based view scheduling')
     parser.add_argument('--dropout', type=float, default=0.5,
                         help='Dropout rate for fully connected layers')
-
+    parser.add_argument('--motion-mode', type=str, default='static', choices=['static', 'learnable'],
+                        help='Motion estimation mode: static (OpenCV) or learnable (end-to-end flow-net)')
+    
     # Class selection
     parser.add_argument('--selected-classes', type=str, default=None,
                         help='Comma-separated list of class names to use (e.g. "chair,table,sofa,bed,car")')
@@ -83,19 +85,19 @@ class SimpleFlowNet(nn.Module):
 
 # ========== Motion Enhanced MVCNN Model ==========
 class MotionEnhancedMVCNN(nn.Module):
-    def __init__(self, num_classes=40, motion_threshold=0.05):
+    def __init__(self, num_classes=40, motion_threshold=0.05, motion_mode='static'):
         super().__init__()
         self.motion_threshold = motion_threshold
+        self.motion_mode = motion_mode
 
-        # 1) Split ResNet-18 into explicit blocks
         resnet = resnet18(pretrained=True)
         self.conv1   = nn.Sequential(resnet.conv1, resnet.bn1, resnet.relu, resnet.maxpool)
         self.layer1  = resnet.layer1
-        self.layer2  = resnet.layer2   # ⇒ coarse features (B,128,H/8,W/8)
+        self.layer2  = resnet.layer2   # (B,128,H/8,W/8)
         self.layer3  = resnet.layer3
-        self.layer4  = resnet.layer4   # ⇒ fine features   (B,512,H/32,W/32)
+        self.layer4  = resnet.layer4   # (B,512,H/32,W/32)
 
-        # 2) Occlusion/refinement at both scales
+        # Occlusion/refinement at both scales (now expects 2D+2 input)
         self.occl_s1 = nn.Sequential(
             nn.Conv2d(128*2 + 2, 256, 3, padding=1), nn.ReLU(),
             nn.Conv2d(256, 128, 3, padding=1),      nn.ReLU()
@@ -105,12 +107,26 @@ class MotionEnhancedMVCNN(nn.Module):
             nn.Conv2d(512, 512, 3, padding=1),      nn.ReLU()
         )
 
-        # 3) Final classifier now takes (128+512)-dim global feature
+        # Visibility heads for soft occlusion masks (coarse and fine)
+        self.visibility_head_s1 = nn.Sequential(
+            nn.Conv2d(128*2, 64, 3, padding=1), nn.ReLU(),
+            nn.Conv2d(64, 2, 3, padding=1), nn.Sigmoid()
+        )
+        self.visibility_head_s2 = nn.Sequential(
+            nn.Conv2d(512*2, 128, 3, padding=1), nn.ReLU(),
+            nn.Conv2d(128, 2, 3, padding=1), nn.Sigmoid()
+        )
+
         self.classifier = nn.Sequential(
             nn.AdaptiveAvgPool2d(1), nn.Flatten(),
             nn.Linear(128+512, 256), nn.ReLU(),
             nn.Linear(256, num_classes)
         )
+
+        if self.motion_mode == 'learnable':
+            self.flow_net = SimpleFlowNet()
+        else:
+            self.flow_net = None
 
     def extract_scales(self, x):
         """Run x through ResNet up to layer2 (coarse) and layer4 (fine)."""
@@ -173,8 +189,9 @@ class MotionEnhancedMVCNN(nn.Module):
         ref_indices = [0]
         last = 0
         mv = motion_vectors
-        mag = mv.norm(dim=-1)
-        mag = mag.mean(dim=[0,2,3,4])
+        mag = mv.norm(dim=-1)            # (B,N,N,H,W)
+        mag = mag.mean(dim=[0,3,4])      # (N,N)  mean over batch, H, W
+
         for i in range(1, N-1):
             if mag[last, i] > self.motion_threshold:
                 ref_indices.append(i)
@@ -183,95 +200,104 @@ class MotionEnhancedMVCNN(nn.Module):
             ref_indices.append(N-1)
         return ref_indices
 
-    def estimate_motion(self, views):
-        """Estimate optical flow between all pairs of views"""
+    def estimate_motion(self, views, needed_pairs=None):
+        """Estimate optical flow between all pairs of views using learnable flow-net if in learnable mode"""
         B, N, C, H, W = views.shape
-        motion_vectors = torch.zeros(B, N, N, H, W, 2, device=views.device)
-        for i in range(N):
-            for j in range(N):
-                if i == j:
-                    continue
-                # Simple approximation using scaled coordinate differences
-                # In a real implementation, use optical flow or learned flow
-                flow_x = torch.zeros((B, H, W), device=views.device)
-                flow_y = torch.zeros((B, H, W), device=views.device)
-                motion_vectors[:, i, j, :, :, 0] = flow_x
-                motion_vectors[:, i, j, :, :, 1] = flow_y
+        device = views.device
+        if needed_pairs is None:
+            needed_pairs = [(i, j) for i in range(N) for j in range(N) if i != j]
+        motion_vectors = {}
+        for i, j in needed_pairs:
+            img_i = views[:, i]
+            img_j = views[:, j]
+            flow = self.flow_net(img_i, img_j)  # (B, 2, H, W)
+            flow = flow.permute(0, 2, 3, 1)  # (B, H, W, 2)
+            motion_vectors[(i, j)] = flow
         return motion_vectors
 
     def forward(self, views, motion_vectors=None):
         B, N, C, H, W = views.shape
-
-        # Estimate motion if not provided
-        if motion_vectors is None:
+        if self.motion_mode == 'learnable':
+            # First, use zero motion to get initial ref schedule
+            zero_motion = torch.zeros(B, N, N, H, W, 2, device=views.device)
+            ref_idxs = self.dynamic_view_schedule(zero_motion)
+            pred_idxs = [i for i in range(N) if i not in ref_idxs]
+            # Only compute needed pairs for warping
+            needed_pairs = []
+            for vid in pred_idxs:
+                bef = max([r for r in ref_idxs if r < vid], default=None)
+                aft = min([r for r in ref_idxs if r > vid], default=None)
+                for r in (bef, aft):
+                    if r is not None:
+                        needed_pairs.append((r, vid))
+            # Compute only needed flows
+            motion_dict = self.estimate_motion(views, needed_pairs)
+            # Now build a motion_vectors tensor for dynamic_view_schedule
+            motion_vectors = torch.zeros(B, N, N, H, W, 2, device=views.device)
+            for (i, j), flow in motion_dict.items():
+                motion_vectors[:, i, j] = flow
+        elif motion_vectors is None:
             motion_vectors = self.estimate_motion(views)
-
-        # dynamic scheduler stays the same…
-        ref_idxs = self.dynamic_view_schedule(motion_vectors)
-        pred_idxs= [i for i in range(N) if i not in ref_idxs]
-
-        # 1) extract and stash ref features at both scales
+            ref_idxs = self.dynamic_view_schedule(motion_vectors)
+            pred_idxs = [i for i in range(N) if i not in ref_idxs]
+        else:
+            ref_idxs = self.dynamic_view_schedule(motion_vectors)
+            pred_idxs = [i for i in range(N) if i not in ref_idxs]
         ref1, ref2 = self.get_reference_views(views, ref_idxs)
-        _,R,C1,h1,w1 = ref1.shape
-        _,_,C2,h2,w2 = ref2.shape
-
-        all1 = views.new_zeros(B, N, C1, h1, w1)
-        all2 = views.new_zeros(B, N, C2, h2, w2)
-        for i,vid in enumerate(ref_idxs):
-            all1[:,vid] = ref1[:,i]
-            all2[:,vid] = ref2[:,i]
-
-        # 2) for each predicted view, warp & refine at both scales
+        _, R, C1, h1, w1 = ref1.shape
+        _, _, C2, h2, w2 = ref2.shape
+        # Instead of in-place assignment, use lists and stack at the end for autograd safety
+        all1_list = [None] * N
+        all2_list = [None] * N
+        for i, vid in enumerate(ref_idxs):
+            all1_list[vid] = ref1[:, i]
+            all2_list[vid] = ref2[:, i]
         for vid in pred_idxs:
-            bef = max([r for r in ref_idxs if r<vid], default=None)
-            aft = min([r for r in ref_idxs if r>vid], default=None)
-            warps1, masks1, warps2, masks2 = [], [], [], []
-            for r in (bef,aft):
-                if r is None: continue
-
-                # downsample motion to coarse / fine grids
-                mv     = motion_vectors[:,r,vid]                          # (B,H,W,2)
-                mv_s1  = F.interpolate(mv.permute(0,3,1,2), size=(h1,w1),
-                                       mode='bilinear', align_corners=True
-                                      ).permute(0,2,3,1)
-                mv_s2  = F.interpolate(mv.permute(0,3,1,2), size=(h2,w2),
-                                       mode='bilinear', align_corners=True
-                                      ).permute(0,2,3,1)
-
-                # warp
-                ref_f1 = all1[:,r].unsqueeze(1)    # (B,1,C1,h1,w1)
-                ref_f2 = all2[:,r].unsqueeze(1)    # (B,1,C2,h2,w2)
-                w1_   = self.warp_features(ref_f1, mv_s1)
-                w2_   = self.warp_features(ref_f2, mv_s2)
-
-                # simple occlusion masks
-                occ1  = (mv_s1.norm(dim=-1)<self.motion_threshold).unsqueeze(1)
-                occ2  = (mv_s2.norm(dim=-1)<self.motion_threshold).unsqueeze(1)
-
-                warps1.append(w1_); masks1.append(occ1)
-                warps2.append(w2_); masks2.append(occ2)
-
-            if len(warps1)==2:
-                # refine coarse
-                f1_cat = torch.cat(warps1,dim=1).view(B,2*C1,h1,w1)
-                m1_cat = torch.cat(masks1,dim=1)
-                all1[:,vid] = self.occl_s1(torch.cat([f1_cat,m1_cat],dim=1))
-
-                # refine fine
-                f2_cat = torch.cat(warps2,dim=1).view(B,2*C2,h2,w2)
-                m2_cat = torch.cat(masks2,dim=1)
-                all2[:,vid] = self.occl_s2(torch.cat([f2_cat,m2_cat],dim=1))
-
-        # 3) fuse scales & classify
-        up1    = F.interpolate(all1, size=(h2,w2),
-                               mode='bilinear', align_corners=True)
-        fused  = torch.cat([up1, all2], dim=2)    # (B,N,C1+C2,h2,w2)
-        global_feat,_ = fused.max(dim=1)          # (B,C1+C2,h2,w2)
+            bef = max([r for r in ref_idxs if r < vid], default=None)
+            aft = min([r for r in ref_idxs if r > vid], default=None)
+            warps1, warps2 = [], []
+            for r in (bef, aft):
+                if r is None:
+                    continue
+                if self.motion_mode == 'learnable':
+                    mv = motion_dict[(r, vid)]
+                else:
+                    mv = motion_vectors[:, r, vid]
+                mv_s1 = F.interpolate(mv.permute(0, 3, 1, 2), size=(h1, w1), mode='bilinear', align_corners=True).permute(0, 2, 3, 1)
+                mv_s2 = F.interpolate(mv.permute(0, 3, 1, 2), size=(h2, w2), mode='bilinear', align_corners=True).permute(0, 2, 3, 1)
+                ref_f1 = all1_list[r].unsqueeze(1)
+                ref_f2 = all2_list[r].unsqueeze(1)
+                w1_ = self.warp_features(ref_f1, mv_s1)
+                w2_ = self.warp_features(ref_f2, mv_s2)
+                warps1.append(w1_)
+                warps2.append(w2_)
+            if len(warps1) == 2:
+                # Coarse scale: soft mask fusion
+                f1_cat = torch.cat(warps1, dim=1).view(B, 2 * C1, h1, w1)
+                vis1 = self.visibility_head_s1(f1_cat)  # (B,2,h1,w1)
+                combine1 = torch.cat([f1_cat, vis1], dim=1)
+                all1_list[vid] = self.occl_s1(combine1)
+                # Fine scale: soft mask fusion
+                f2_cat = torch.cat(warps2, dim=1).view(B, 2 * C2, h2, w2)
+                vis2 = self.visibility_head_s2(f2_cat)  # (B,2,h2,w2)
+                combine2 = torch.cat([f2_cat, vis2], dim=1)
+                all2_list[vid] = self.occl_s2(combine2)
+        all1 = torch.stack(all1_list, dim=1)
+        all2 = torch.stack(all2_list, dim=1)
+        B, N, C1, h1, w1 = all1.shape
+        _, _, C2, h2, w2 = all2.shape
+        all1_reshape = all1.view(B * N, C1, h1, w1)
+        up1 = F.interpolate(all1_reshape, size=(h2, w2), mode='bilinear', align_corners=True)
+        up1 = up1.view(B, N, C1, h2, w2)
+        fused = torch.cat([up1, all2], dim=2)
+        global_feat, _ = fused.max(dim=1)
         return self.classifier(global_feat)
 
 # ========== Dataset Handling ==========
 class MotionMVCNNDataset(Dataset):
     """Motion-Enhanced Multi-View CNN Dataset"""
+    printed_view_count = False  # Class variable to control printing
+
     def __init__(self, dataset_path, split='train', transform=None, selected_classes=None, compute_flow=True):
         self.dataset_path = dataset_path
         self.split = split
@@ -337,54 +363,50 @@ class MotionMVCNNDataset(Dataset):
     
     def __getitem__(self, idx):
         sample = self.samples[idx]
-        
-        # Load all views for this model
         views = []
-        raw_views = []  # Keep originals for flow computation
+        # Print the number of views for this sample only once per session
+        if not MotionMVCNNDataset.printed_view_count:
+            print(f"Number of views for sample {idx}: {len(sample['view_files'])}")
+            MotionMVCNNDataset.printed_view_count = True
         for view_file in sample['view_files']:
             img = Image.open(view_file).convert('RGB')
-            raw_views.append(np.array(img))
             if self.transform:
                 img = self.transform(img)
             views.append(img)
-        
-        # Stack views into a tensor [num_views, channels, height, width]
         views = torch.stack(views)
-        
-        # Create empty motion vectors tensor
-        num_views = len(views)
-        
-        # Structure for motion vectors: [num_views, num_views, H, W, 2]
-        motion_vectors = torch.zeros(num_views, num_views, views.shape[2], views.shape[3], 2)
-        
-        # Compute optical flow between views if requested
+        # Only return motion_vectors if compute_flow is True (static mode)
         if self.compute_flow:
+            num_views = views.shape[0]
+            H, W = views.shape[2], views.shape[3]
+            motion_vectors = torch.zeros(num_views, num_views, H, W, 2)
             for i in range(num_views):
-                img_i = raw_views[i]
-                img_i_gray = cv2.cvtColor(img_i, cv2.COLOR_RGB2GRAY)
-                
+                img_i = views[i].permute(1,2,0).numpy()  # (H,W,C)
+                img_i_gray = cv2.cvtColor((img_i*255).astype(np.uint8), cv2.COLOR_RGB2GRAY)
                 for j in range(num_views):
                     if i != j:
-                        img_j = raw_views[j]
-                        img_j_gray = cv2.cvtColor(img_j, cv2.COLOR_RGB2GRAY)
-                        
-                        # Calculate optical flow
+                        img_j = views[j].permute(1,2,0).numpy()
+                        img_j_gray = cv2.cvtColor((img_j*255).astype(np.uint8), cv2.COLOR_RGB2GRAY)
                         flow = cv2.calcOpticalFlowFarneback(
                             img_i_gray, img_j_gray, None, 
                             0.5, 3, 15, 3, 5, 1.2, 0
                         )
-                        
-                        # Resize flow to match transformed image size
-                        flow = cv2.resize(flow, (views.shape[2], views.shape[3]))
+                        flow = cv2.resize(flow, (W, H))
                         motion_vectors[i, j] = torch.from_numpy(flow).float()
-        
-        return {
-            'views': views,
-            'motion_vectors': motion_vectors,
-            'label': sample['class_idx'],
-            'class_name': sample['class_name'],
-            'model_name': sample['model_name']
-        }
+            return {
+                'views': views,
+                'motion_vectors': motion_vectors,
+                'label': sample['class_idx'],
+                'class_name': sample['class_name'],
+                'model_name': sample['model_name']
+            }
+        else:
+            # In learnable mode, do not return motion_vectors to save memory
+            return {
+                'views': views,
+                'label': sample['class_idx'],
+                'class_name': sample['class_name'],
+                'model_name': sample['model_name']
+            }
 
 # ========== Training and Evaluation Functions ==========
 def train_one_epoch(model, dataloader, criterion, optimizer, device):
@@ -395,31 +417,26 @@ def train_one_epoch(model, dataloader, criterion, optimizer, device):
     
     for batch_idx, data in enumerate(dataloader):
         views = data['views'].to(device)
-        motion_vectors = data['motion_vectors'].to(device)
         labels = data['label'].to(device)
-        
-        optimizer.zero_grad()
-        
-        outputs = model(views, motion_vectors)
+        if 'motion_vectors' in data:
+            motion_vectors = data['motion_vectors'].to(device)
+            outputs = model(views, motion_vectors)
+        else:
+            outputs = model(views)
         loss = criterion(outputs, labels)
-        
+        optimizer.zero_grad()
         loss.backward()
         optimizer.step()
-        
         running_loss += loss.item()
-        
         _, predicted = outputs.max(1)
         total += labels.size(0)
         correct += predicted.eq(labels).sum().item()
-        
         # Print progress
         if (batch_idx + 1) % 10 == 0:
             print(f'Batch: {batch_idx+1}/{len(dataloader)} | Loss: {loss.item():.4f} | ' +
                   f'Acc: {100 * correct / total:.2f}% ({correct}/{total})')
-    
     epoch_loss = running_loss / len(dataloader)
     epoch_acc = 100 * correct / total
-    
     return epoch_loss, epoch_acc
 
 def evaluate(model, dataloader, criterion, device):
@@ -427,27 +444,24 @@ def evaluate(model, dataloader, criterion, device):
     running_loss = 0.0
     correct = 0
     total = 0
-    
     all_preds = []
     all_labels = []
     class_correct = {}
     class_total = {}
-    
     with torch.no_grad():
         for batch_idx, data in enumerate(dataloader):
             views = data['views'].to(device)
-            motion_vectors = data['motion_vectors'].to(device)
             labels = data['label'].to(device)
-            
-            outputs = model(views, motion_vectors)
+            if 'motion_vectors' in data:
+                motion_vectors = data['motion_vectors'].to(device)
+                outputs = model(views, motion_vectors)
+            else:
+                outputs = model(views)
             loss = criterion(outputs, labels)
-            
             running_loss += loss.item()
-            
             _, predicted = outputs.max(1)
             total += labels.size(0)
             correct += predicted.eq(labels).sum().item()
-            
             # Track per-class accuracy
             for i in range(labels.size(0)):
                 label = labels[i].item()
@@ -458,20 +472,16 @@ def evaluate(model, dataloader, criterion, device):
                 class_total[label] += 1
                 if label == pred:
                     class_correct[label] += 1
-            
             # Track predictions and labels for confusion matrix
             all_preds.extend(predicted.cpu().numpy())
             all_labels.extend(labels.cpu().numpy())
-    
     # Calculate loss and accuracy
     epoch_loss = running_loss / len(dataloader)
     epoch_acc = 100 * correct / total
-    
     # Calculate per-class accuracy
     class_acc = {}
     for label in class_total:
         class_acc[label] = 100 * class_correct[label] / class_total[label]
-    
     return {
         'loss': epoch_loss,
         'accuracy': epoch_acc,
@@ -523,10 +533,11 @@ def main():
     ])
     
     # Create datasets
+    compute_flow = args.motion_mode == 'static'
     train_dataset = MotionMVCNNDataset(args.dataset_path, split='train', transform=train_transform, 
-                                      selected_classes=selected_classes)
+                                      selected_classes=selected_classes, compute_flow=compute_flow)
     test_dataset = MotionMVCNNDataset(args.dataset_path, split='test', transform=test_transform,
-                                     selected_classes=selected_classes)
+                                     selected_classes=selected_classes, compute_flow=compute_flow)
     
     # Create data loaders
     use_pin_memory = torch.cuda.is_available() and args.device == 'cuda'
@@ -540,7 +551,8 @@ def main():
     
     # Create model
     model = MotionEnhancedMVCNN(num_classes=len(train_dataset.classes), 
-                              motion_threshold=args.motion_threshold)
+                              motion_threshold=args.motion_threshold,
+                              motion_mode=args.motion_mode)
     
     # Move model to device
     model = model.to(device)

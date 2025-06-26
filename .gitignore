@@ -6,3 +6,5 @@ blender-3.6/
 mvcnn_dataset/
 
 mvcnn_results/
+
+motion_mvcnn_results/
