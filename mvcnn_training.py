@@ -128,7 +128,11 @@ class MVCNNDataset(Dataset):
                 
                 # Limit the number of views if specified
                 if self.max_views is not None:
-                    view_files = view_files[:self.max_views]
+                    total_views = len(view_files)
+                    if self.max_views < total_views:
+                        # Select evenly spaced views for better coverage
+                        indices = [int(i * total_views / self.max_views) for i in range(self.max_views)]
+                        view_files = [view_files[i] for i in indices]
                 
                 self.samples.append({
                     'class_name': class_name,
@@ -324,8 +328,11 @@ def main():
         selected_classes = selected_classes[:args.num_classes]
     print(f"Selected classes: {selected_classes}")
 
-    # Create output directory
-    os.makedirs(args.output_dir, exist_ok=True)
+    # Create output directory with timestamp
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M")
+    output_dir = os.path.join('mvcnn_results', f'train_{timestamp}')
+    os.makedirs(output_dir, exist_ok=True)
+    args.output_dir = output_dir
     
     # Set device
     device = torch.device(args.device if torch.cuda.is_available() and args.device == 'cuda' else 'cpu')
