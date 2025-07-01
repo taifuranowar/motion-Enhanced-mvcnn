@@ -5,7 +5,11 @@ import json
 import time
 import sys
 import argparse
+import subprocess
+import multiprocessing
+import contextlib
 from mathutils import Vector
+from tqdm import tqdm
 
 # ========== Default Configuration ==========
 # These defaults can be overridden by command line arguments
@@ -72,10 +76,18 @@ def parse_args():
     
     # Class-specific processing
     parser.add_argument('--only-class', type=str,
-                        help='Only process this specific class')
+                    help='Only process this specific class')
     parser.add_argument('--list-classes', action='store_true',
-                        help='List all available classes and exit')
+                    help='List all available classes and exit')
+    parser.add_argument('--max-classes', type=int, default=None,
+                    help='Maximum number of classes to process (default: all)')
                         
+    # Add parallel processing option
+    parser.add_argument('--parallel', action='store_true',
+                    help='Use parallel processing (each class in separate Blender instance)')
+    parser.add_argument('--blender-path', type=str, default='blender',
+        help='Path to Blender executable (used only for parallel mode)')
+    
     args = parser.parse_args(argv)
     return args
 
@@ -238,6 +250,14 @@ def setup_scene(demo_mode=False):
 def configure_render_settings(args, demo_mode=False):
     """Configure rendering settings"""
     render = bpy.context.scene.render
+    
+    # Silence Blender's output messages
+    render.use_file_extension = True
+    bpy.context.preferences.view.show_splash = False
+    
+    # This is the key line to suppress render output messages
+    bpy.app.debug_value = 0  # Silent mode
+    bpy.context.preferences.view.render_display_type = 'NONE'
     
     # Set resolution
     render.resolution_x = args.image_size
@@ -544,7 +564,7 @@ def generate_renderings(obj, class_name, model_name, camera, camera_positions, s
     }
     
     # Render from each camera position
-    for pos in camera_positions:
+    for pos in tqdm(camera_positions, desc=f"Rendering {class_name}/{model_name} ({split_type})", leave=False):
         view_idx = pos["view_idx"]
         elev = pos["elevation"]
         azimuth = pos["azimuth"]
@@ -563,10 +583,10 @@ def generate_renderings(obj, class_name, model_name, camera, camera_positions, s
         
         # Set render path
         bpy.context.scene.render.filepath = view_filepath
-        
-        # Render
-        print(f"    Rendering view {view_idx}: {view_filepath}")
-        bpy.ops.render.render(write_still=True)
+
+        # Suppress Blender's render output
+        with contextlib.redirect_stdout(open(os.devnull, 'w')), contextlib.redirect_stderr(open(os.devnull, 'w')):
+            bpy.ops.render.render(write_still=True)
         
         # Add to metadata
         metadata["views"].append({
@@ -582,6 +602,32 @@ def generate_renderings(obj, class_name, model_name, camera, camera_positions, s
     with open(metadata_path, 'w') as f:
         json.dump(metadata, f, indent=2)
     print(f"    Saved metadata to {metadata_path}")
+    
+    # Write/update class-specific metadata for merging
+    class_metadata_file = os.path.join(args.output_dir, f"{class_name}_metadata.json")
+    if os.path.exists(class_metadata_file):
+        with open(class_metadata_file, 'r') as f:
+            class_metadata = json.load(f)
+    else:
+        class_metadata = {
+            "class_name": class_name,
+            "train_models": [],
+            "test_models": []
+        }
+
+    model_entry = {
+        "model_name": model_name,
+        "model_dir": model_output_dir
+    }
+
+    if split_type == "train":
+        class_metadata["train_models"].append(model_entry)
+    else:
+        class_metadata["test_models"].append(model_entry)
+
+    with open(class_metadata_file, 'w') as f:
+        json.dump(class_metadata, f, indent=2)
+    print(f"    Saved class metadata to {class_metadata_file}")
     
     return model_output_dir
 
@@ -775,7 +821,6 @@ def run_camera_animation_demo(args):
     print(f"Animation setup complete. Use Ctrl+F12 to render animation or press play in the timeline to preview.")
     print(f"Output will be saved to: {output_file}")
     
-    # ...rest of existing code...
 def process_modelnet40(args):
     """Process ModelNet40 dataset to create MVCNN dataset"""
     print(f"Starting MVCNN dataset generation")
@@ -821,6 +866,11 @@ def process_modelnet40(args):
         else:
             print(f"ERROR: Specified class '{args.only_class}' not found")
             return
+    
+    # Limit number of classes if specified
+    if args.max_classes is not None:
+        class_dirs = class_dirs[:args.max_classes]
+        print(f"Limited to first {len(class_dirs)} classes")
     
     # Process each class
     for class_idx, class_name in enumerate(class_dirs):
@@ -927,6 +977,84 @@ def process_modelnet40(args):
     print(f"MVCNN dataset creation complete. Output directory: {args.output_dir}")
     print(f"Dataset contains {len(dataset_metadata['classes'])} classes")
 
+# ========== Parallel Processing Functions ==========
+def get_class_list(modelnet_dir):
+    return [d for d in os.listdir(modelnet_dir) 
+            if os.path.isdir(os.path.join(modelnet_dir, d))]
+
+def process_class(args):
+    class_name, modelnet_dir, output_dir, blender_path = args
+    start_time = time.time()
+    cmd = [
+        blender_path, 
+        "--background", 
+        "--python", "mvcnn_dataset_generator.py", 
+        "--", 
+        f"--modelnet-dir={modelnet_dir}", 
+        f"--output-dir={output_dir}", 
+        f"--only-class={class_name}"
+        # DO NOT add --blender-path here!
+    ]
+    print(f"[{class_name}] Started processing.")
+    subprocess.run(cmd)
+    elapsed = time.time() - start_time
+    print(f"[{class_name}] Completed in {elapsed/60:.1f} min.")
+    return (class_name, elapsed)
+
+def run_parallel_processing(args):
+    class_list = get_class_list(args.modelnet_dir)
+    if args.max_classes is not None:
+        class_list = class_list[:args.max_classes]
+    num_workers = args.num_processes if hasattr(args, 'num_processes') else multiprocessing.cpu_count()
+    print(f"Processing {len(class_list)} classes in parallel ({num_workers} workers)")
+
+    start_time = time.time()
+    results = []
+    with multiprocessing.Pool(num_workers) as pool:
+        for result in tqdm(pool.imap_unordered(process_class, [
+            (c, args.modelnet_dir, args.output_dir, args.blender_path) for c in class_list
+        ]), total=len(class_list), desc="Overall Progress"):
+            results.append(result)
+            # Print per-class remaining time estimate
+            done = len(results)
+            avg_time = sum(r[1] for r in results) / done
+            remaining = (len(class_list) - done) * avg_time
+            print(f"Estimated time left: {remaining/60:.1f} min | Last: {result[0]} ({result[1]/60:.1f} min)")
+
+    total_time = time.time() - start_time
+    print(f"All classes processed in {total_time/60:.1f} min.")
+
+    # Combine metadata files from parallel runs
+    print("All classes processed. Combining metadata...")
+
+    # FIX: Generate camera positions here
+    camera_positions = generate_camera_positions(args)
+
+    # Create dataset metadata structure
+    dataset_metadata = {
+        "name": "ModelNet40-MVCNN",
+        "date_created": time.strftime("%Y-%m-%d %H:%M:%S"),
+        "views_per_model": len(camera_positions),
+        "image_size": args.image_size,
+        "classes": []
+    }
+
+    # Read and merge all class metadata files
+    for class_name in class_list:
+        class_metadata_file = os.path.join(args.output_dir, f"{class_name}_metadata.json")
+        if os.path.exists(class_metadata_file):
+            with open(class_metadata_file, 'r') as f:
+                class_metadata = json.load(f)
+                dataset_metadata["classes"].append(class_metadata)
+            # Remove temporary file
+            os.remove(class_metadata_file)
+
+    # Save final metadata
+    with open(os.path.join(args.output_dir, "dataset_metadata.json"), 'w') as f:
+        json.dump(dataset_metadata, f, indent=2)
+    
+    print("Parallel processing complete!")
+
 # ========== Main Execution ==========
 def main():
     # Parse command line arguments
@@ -945,8 +1073,15 @@ def main():
         # Just list classes (validate_paths will handle this)
         validate_paths(args)
     else:
-        # Regular dataset generation mode
-        process_modelnet40(args)
+        # Check if we're running in parallel or sequential mode
+        if hasattr(args, 'parallel') and args.parallel:
+            # Parallel processing mode
+            print("Running in parallel processing mode")
+            run_parallel_processing(args)
+        else:
+            # Sequential processing mode
+            print("Running in sequential processing mode")
+            process_modelnet40(args)
 
 if __name__ == "__main__":
     main()

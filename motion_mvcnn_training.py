@@ -20,6 +20,10 @@ import seaborn as sns
 def parse_args():
     parser = argparse.ArgumentParser(description='Motion Enhanced MVCNN Training')
     
+    # Add elevation parameter
+    parser.add_argument('--elevations', type=str, default=None,
+                        help='Comma-separated list of elevations to use (e.g. "0,30"). If not specified, use all available elevations.')
+    
     # Add max-views parameter
     parser.add_argument('--max-views', type=int, default=None,
                         help='Maximum number of views to use per model (default: use all available views)')
@@ -179,15 +183,12 @@ class MotionEnhancedMVCNN(nn.Module):
         )
         return warped.view(B, 1, C, h, w)
 
-    def dynamic_view_schedule(self, motion_vectors):
+    def dynamic_view_schedule(self, motion_vectors, elevations=None, azimuths=None):
         """
-        Greedy algorithm: start at view 0, 
+        Enhanced algorithm: start at view 0, 
         then whenever avg motion from last_ref to i > threshold, mark i as new reference.
+        Also ensure coverage of all elevations when elevation data is available.
         Always include the last view.
-        Args:
-            motion_vectors: (B, N, N, H, W, 2)
-        Returns:
-            ref_indices: list of ints
         """
         B, N, _, H, W, _ = motion_vectors.shape
         ref_indices = [0]
@@ -196,13 +197,34 @@ class MotionEnhancedMVCNN(nn.Module):
         mag = mv.norm(dim=-1)            # (B,N,N,H,W)
         mag = mag.mean(dim=[0,3,4])      # (N,N)  mean over batch, H, W
 
+        # If elevation data is provided, use it to enhance scheduling
+        if elevations is not None and elevations.numel() > 0:
+            elevs = elevations[0].cpu().numpy()  # First item in batch
+            unique_elevs = sorted(set(elevs))
+            
+            # First pass: ensure we have at least one reference view per elevation
+            if len(unique_elevs) > 1:  # Only needed for multiple elevations
+                for elev in unique_elevs:
+                    elev_indices = [i for i, e in enumerate(elevs) if e == elev]
+                    # Check if we already have a ref view at this elevation
+                    if not any(idx in ref_indices for idx in elev_indices):
+                        # Find best view at this elevation (max motion or center view)
+                        if len(elev_indices) > 0:
+                            best_idx = elev_indices[len(elev_indices) // 2]  # Middle view as default
+                            ref_indices.append(best_idx)
+
+        # Second pass: add reference views based on motion threshold (existing logic)
         for i in range(1, N-1):
-            if mag[last, i] > self.motion_threshold:
+            if i not in ref_indices and mag[last, i] > self.motion_threshold:
                 ref_indices.append(i)
                 last = i
-        if ref_indices[-1] != N-1:
+                
+        # Always include the last view if not already included
+        if N-1 not in ref_indices:
             ref_indices.append(N-1)
-        return ref_indices
+        
+        # Sort indices to maintain original order
+        return sorted(ref_indices)
 
     def estimate_motion(self, views, needed_pairs=None):
         """Estimate optical flow between all pairs of views using learnable flow-net if in learnable mode"""
@@ -219,12 +241,12 @@ class MotionEnhancedMVCNN(nn.Module):
             motion_vectors[(i, j)] = flow
         return motion_vectors
 
-    def forward(self, views, motion_vectors=None):
+    def forward(self, views, motion_vectors=None, elevations=None, azimuths=None):
         B, N, C, H, W = views.shape
         if self.motion_mode == 'learnable':
             # First, use zero motion to get initial ref schedule
             zero_motion = torch.zeros(B, N, N, H, W, 2, device=views.device)
-            ref_idxs = self.dynamic_view_schedule(zero_motion)
+            ref_idxs = self.dynamic_view_schedule(zero_motion, elevations, azimuths)
             pred_idxs = [i for i in range(N) if i not in ref_idxs]
             # Only compute needed pairs for warping
             needed_pairs = []
@@ -242,10 +264,10 @@ class MotionEnhancedMVCNN(nn.Module):
                 motion_vectors[:, i, j] = flow
         elif motion_vectors is None:
             motion_vectors = self.estimate_motion(views)
-            ref_idxs = self.dynamic_view_schedule(motion_vectors)
+            ref_idxs = self.dynamic_view_schedule(motion_vectors, elevations, azimuths)
             pred_idxs = [i for i in range(N) if i not in ref_idxs]
         else:
-            ref_idxs = self.dynamic_view_schedule(motion_vectors)
+            ref_idxs = self.dynamic_view_schedule(motion_vectors, elevations, azimuths)
             pred_idxs = [i for i in range(N) if i not in ref_idxs]
         ref1, ref2 = self.get_reference_views(views, ref_idxs)
         _, R, C1, h1, w1 = ref1.shape
@@ -302,13 +324,18 @@ class MotionMVCNNDataset(Dataset):
     """Motion-Enhanced Multi-View CNN Dataset"""
     printed_view_count = False  # Class variable to control printing
 
-    def __init__(self, dataset_path, split='train', transform=None, selected_classes=None, compute_flow=True, max_views=None):
+    def __init__(self, dataset_path, split='train', transform=None, selected_classes=None, compute_flow=True, max_views=None, elevations=None):
         self.dataset_path = dataset_path
         self.split = split
         self.transform = transform
         self.selected_classes = selected_classes
         self.compute_flow = compute_flow
         self.max_views = max_views
+        self.elevations = elevations  # List of elevation values to use or None for all
+        
+        # Parse elevations if provided as string
+        if isinstance(self.elevations, str):
+            self.elevations = [float(e.strip()) for e in self.elevations.split(',')]
         
         # Path to renders directory
         self.renders_path = os.path.join(dataset_path, 'renders')
@@ -322,7 +349,7 @@ class MotionMVCNNDataset(Dataset):
         
         # Build class list and mapping
         for idx, class_data in enumerate(self.metadata['classes']):
-            class_name = class_data['class_name']
+            class_name = class_data.get('class_name', class_data.get('class'))
             if self.selected_classes is not None and class_name not in self.selected_classes:
                 continue
             self.classes.append(class_name)
@@ -332,7 +359,7 @@ class MotionMVCNNDataset(Dataset):
         
         # Build dataset samples list
         for class_data in self.metadata['classes']:
-            class_name = class_data['class_name']
+            class_name = class_data.get('class_name', class_data.get('class'))
             if self.selected_classes is not None and class_name not in self.selected_classes:
                 continue
             class_idx = self.class_to_idx[class_name]
@@ -351,24 +378,69 @@ class MotionMVCNNDataset(Dataset):
                 with open(os.path.join(model_path, 'metadata.json'), 'r') as f:
                     model_metadata = json.load(f)
                 
-                # Get view filenames sorted by view_idx
+                # Get view filenames along with their elevation and azimuth
                 view_files = []
+                view_elevations = []
+                view_azimuths = []
                 for view in sorted(model_metadata['views'], key=lambda x: x['view_idx']):
-                    view_files.append(os.path.join(model_path, view['filename']))
-                
-                # Limit the number of views if specified
-                if self.max_views is not None:
-                    total_views = len(view_files)
-                    if self.max_views < total_views:
-                        # Select evenly spaced views for better coverage
-                        indices = [int(i * total_views / self.max_views) for i in range(self.max_views)]
-                        view_files = [view_files[i] for i in indices]
+                    # Filter by elevation if specified
+                    if self.elevations is not None and view['elevation'] not in self.elevations:
+                        continue
                     
+                    view_files.append(os.path.join(model_path, view['filename']))
+                    view_elevations.append(view['elevation'])
+                    view_azimuths.append(view['azimuth'])
+                
+                # Limit the number of views if specified, distributing across elevations
+                if self.max_views is not None:
+                    unique_elevations = sorted(set(view_elevations))
+                    num_unique_elevs = len(unique_elevations)
+                    total_views = len(view_files)
+                    
+                    if num_unique_elevs <= 1 or total_views <= self.max_views:
+                        # Only one elevation or fewer views than max, use standard spacing
+                        if total_views > self.max_views:
+                            indices = [int(i * total_views / self.max_views) for i in range(self.max_views)]
+                            view_files = [view_files[i] for i in indices]
+                            view_elevations = [view_elevations[i] for i in indices]
+                            view_azimuths = [view_azimuths[i] for i in indices]
+                    else:
+                        # Multiple elevations - distribute views across elevations
+                        views_per_elev = self.max_views // num_unique_elevs
+                        remaining = self.max_views % num_unique_elevs
+                        
+                        # If some elevations will get more views
+                        elev_view_counts = {e: views_per_elev for e in unique_elevations}
+                        for i in range(remaining):
+                            elev_view_counts[unique_elevations[i]] += 1
+                        
+                        # Select views for each elevation
+                        selected_indices = []
+                        for elev in unique_elevations:
+                            # Get indices for this elevation
+                            elev_indices = [i for i, e in enumerate(view_elevations) if e == elev]
+                            num_views_for_elev = elev_view_counts[elev]
+                            
+                            if num_views_for_elev > 0 and elev_indices:
+                                # Select evenly spaced views from this elevation
+                                elev_total = len(elev_indices)
+                                elev_selected = [elev_indices[int(i * elev_total / num_views_for_elev)] 
+                                                for i in range(num_views_for_elev)]
+                                selected_indices.extend(elev_selected)
+                        
+                        # Use the selected indices
+                        selected_indices.sort()  # Maintain original order
+                        view_files = [view_files[i] for i in selected_indices]
+                        view_elevations = [view_elevations[i] for i in selected_indices]
+                        view_azimuths = [view_azimuths[i] for i in selected_indices]
+                
                 self.samples.append({
                     'class_name': class_name,
                     'class_idx': class_idx,
                     'model_name': model_name,
-                    'view_files': view_files
+                    'view_files': view_files,
+                    'view_elevations': view_elevations,
+                    'view_azimuths': view_azimuths
                 })
     
     def __len__(self):
@@ -377,16 +449,28 @@ class MotionMVCNNDataset(Dataset):
     def __getitem__(self, idx):
         sample = self.samples[idx]
         views = []
-        # Print the number of views for this sample only once per session
+        # Print the number of views and elevations for this sample only once per session
         if not MotionMVCNNDataset.printed_view_count:
             print(f"Number of views for sample {idx}: {len(sample['view_files'])}")
+            if 'view_elevations' in sample:
+                unique_elevs = sorted(set(sample['view_elevations']))
+                print(f"Elevations used: {unique_elevs}")
+                for elev in unique_elevs:
+                    count = sum(1 for e in sample['view_elevations'] if e == elev)
+                    print(f"  Elevation {elev}°: {count} views")
             MotionMVCNNDataset.printed_view_count = True
+            
         for view_file in sample['view_files']:
             img = Image.open(view_file).convert('RGB')
             if self.transform:
                 img = self.transform(img)
             views.append(img)
         views = torch.stack(views)
+        
+        # Convert elevation and azimuth data to tensors
+        elevations = torch.tensor(sample['view_elevations'], dtype=torch.float32) if 'view_elevations' in sample else None
+        azimuths = torch.tensor(sample['view_azimuths'], dtype=torch.float32) if 'view_azimuths' in sample else None
+        
         # Only return motion_vectors if compute_flow is True (static mode)
         if self.compute_flow:
             num_views = views.shape[0]
@@ -410,15 +494,18 @@ class MotionMVCNNDataset(Dataset):
                 'motion_vectors': motion_vectors,
                 'label': sample['class_idx'],
                 'class_name': sample['class_name'],
-                'model_name': sample['model_name']
+                'model_name': sample['model_name'],
+                'elevations': elevations,
+                'azimuths': azimuths
             }
         else:
-            # In learnable mode, do not return motion_vectors to save memory
             return {
                 'views': views,
                 'label': sample['class_idx'],
                 'class_name': sample['class_name'],
-                'model_name': sample['model_name']
+                'model_name': sample['model_name'],
+                'elevations': elevations,
+                'azimuths': azimuths
             }
 
 # ========== Training and Evaluation Functions ==========
@@ -431,11 +518,17 @@ def train_one_epoch(model, dataloader, criterion, optimizer, device):
     for batch_idx, data in enumerate(dataloader):
         views = data['views'].to(device)
         labels = data['label'].to(device)
+        elevations = data.get('elevations', None)
+        azimuths = data.get('azimuths', None)
+        if elevations is not None:
+            elevations = elevations.to(device)
+        if azimuths is not None:
+            azimuths = azimuths.to(device)
         if 'motion_vectors' in data:
             motion_vectors = data['motion_vectors'].to(device)
-            outputs = model(views, motion_vectors)
+            outputs = model(views, motion_vectors, elevations, azimuths)
         else:
-            outputs = model(views)
+            outputs = model(views, None, elevations, azimuths)
         loss = criterion(outputs, labels)
         optimizer.zero_grad()
         loss.backward()
@@ -550,10 +643,24 @@ def main():
     
     # Create datasets
     compute_flow = args.motion_mode == 'static'
-    train_dataset = MotionMVCNNDataset(args.dataset_path, split='train', transform=train_transform, 
-                                      selected_classes=selected_classes, compute_flow=compute_flow, max_views=args.max_views)
-    test_dataset = MotionMVCNNDataset(args.dataset_path, split='test', transform=test_transform,
-                                     selected_classes=selected_classes, compute_flow=compute_flow, max_views=args.max_views)
+    train_dataset = MotionMVCNNDataset(
+        args.dataset_path, 
+        split='train', 
+        transform=train_transform, 
+        selected_classes=selected_classes, 
+        compute_flow=compute_flow, 
+        max_views=args.max_views,
+        elevations=args.elevations
+    )
+    test_dataset = MotionMVCNNDataset(
+        args.dataset_path, 
+        split='test', 
+        transform=test_transform,
+        selected_classes=selected_classes, 
+        compute_flow=compute_flow, 
+        max_views=args.max_views,
+        elevations=args.elevations
+    )
     
     # Create data loaders
     use_pin_memory = torch.cuda.is_available() and args.device == 'cuda'

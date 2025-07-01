@@ -19,6 +19,10 @@ import seaborn as sns
 def parse_args():
     parser = argparse.ArgumentParser(description='MVCNN Training')
     
+    # Add elevation parameter
+    parser.add_argument('--elevations', type=str, default=None,
+                        help='Comma-separated list of elevations to use (e.g. "0,30"). If not specified, use all available elevations.')
+    
     # Basic configuration
     parser.add_argument('--dataset-path', type=str, required=True,
                         help='Path to the generated MVCNN dataset')
@@ -72,12 +76,17 @@ class MVCNNDataset(Dataset):
     printed_view_count = False  # Class variable to control printing
 
     """Multi-View CNN Dataset"""
-    def __init__(self, dataset_path, split='train', transform=None, selected_classes=None, max_views=None):
+    def __init__(self, dataset_path, split='train', transform=None, selected_classes=None, max_views=None, elevations=None):
         self.dataset_path = dataset_path
         self.split = split
         self.transform = transform
         self.selected_classes = selected_classes
         self.max_views = max_views
+        self.elevations = elevations  # List of elevation values to use or None for all
+        
+        # Parse elevations if provided as string
+        if isinstance(self.elevations, str):
+            self.elevations = [float(e.strip()) for e in self.elevations.split(',')]
         
         # Path to renders directory
         self.renders_path = os.path.join(dataset_path, 'renders')
@@ -112,7 +121,6 @@ class MVCNNDataset(Dataset):
             else:  # test or val
                 models_data = class_data['test_models']
             
-            # When collecting view files:
             for model_data in models_data:
                 model_name = model_data['model_name']
                 model_path = os.path.join(self.renders_path, class_name, split, model_name)
@@ -121,24 +129,69 @@ class MVCNNDataset(Dataset):
                 with open(os.path.join(model_path, 'metadata.json'), 'r') as f:
                     model_metadata = json.load(f)
                 
-                # Get view filenames sorted by view_idx
+                # Get view filenames along with their elevation and azimuth
                 view_files = []
+                view_elevations = []
+                view_azimuths = []
                 for view in sorted(model_metadata['views'], key=lambda x: x['view_idx']):
+                    # Filter by elevation if specified
+                    if self.elevations is not None and view['elevation'] not in self.elevations:
+                        continue
+                    
                     view_files.append(os.path.join(model_path, view['filename']))
+                    view_elevations.append(view['elevation'])
+                    view_azimuths.append(view['azimuth'])
                 
-                # Limit the number of views if specified
+                # Limit the number of views if specified, distributing across elevations
                 if self.max_views is not None:
+                    unique_elevations = sorted(set(view_elevations))
+                    num_unique_elevs = len(unique_elevations)
                     total_views = len(view_files)
-                    if self.max_views < total_views:
-                        # Select evenly spaced views for better coverage
-                        indices = [int(i * total_views / self.max_views) for i in range(self.max_views)]
-                        view_files = [view_files[i] for i in indices]
+                    
+                    if num_unique_elevs <= 1 or total_views <= self.max_views:
+                        # Only one elevation or fewer views than max, use standard spacing
+                        if total_views > self.max_views:
+                            indices = [int(i * total_views / self.max_views) for i in range(self.max_views)]
+                            view_files = [view_files[i] for i in indices]
+                            view_elevations = [view_elevations[i] for i in indices]
+                            view_azimuths = [view_azimuths[i] for i in indices]
+                    else:
+                        # Multiple elevations - distribute views across elevations
+                        views_per_elev = self.max_views // num_unique_elevs
+                        remaining = self.max_views % num_unique_elevs
+                        
+                        # If some elevations will get more views
+                        elev_view_counts = {e: views_per_elev for e in unique_elevations}
+                        for i in range(remaining):
+                            elev_view_counts[unique_elevations[i]] += 1
+                        
+                        # Select views for each elevation
+                        selected_indices = []
+                        for elev in unique_elevations:
+                            # Get indices for this elevation
+                            elev_indices = [i for i, e in enumerate(view_elevations) if e == elev]
+                            num_views_for_elev = elev_view_counts[elev]
+                            
+                            if num_views_for_elev > 0 and elev_indices:
+                                # Select evenly spaced views from this elevation
+                                elev_total = len(elev_indices)
+                                elev_selected = [elev_indices[int(i * elev_total / num_views_for_elev)] 
+                                                for i in range(num_views_for_elev)]
+                                selected_indices.extend(elev_selected)
+                        
+                        # Use the selected indices
+                        selected_indices.sort()  # Maintain original order
+                        view_files = [view_files[i] for i in selected_indices]
+                        view_elevations = [view_elevations[i] for i in selected_indices]
+                        view_azimuths = [view_azimuths[i] for i in selected_indices]
                 
                 self.samples.append({
                     'class_name': class_name,
                     'class_idx': class_idx,
                     'model_name': model_name,
-                    'view_files': view_files
+                    'view_files': view_files,
+                    'view_elevations': view_elevations,
+                    'view_azimuths': view_azimuths
                 })
     
     def __len__(self):
@@ -147,21 +200,35 @@ class MVCNNDataset(Dataset):
     def __getitem__(self, idx):
         sample = self.samples[idx]
         views = []
-        # Print the number of views for this sample only once per session
+        # Print the number of views and elevations for this sample only once per session
         if not MVCNNDataset.printed_view_count:
-            print(f"Number of views per sample: {len(sample['view_files'])}")
+            print(f"Number of views for sample {idx}: {len(sample['view_files'])}")
+            if 'view_elevations' in sample:
+                unique_elevs = sorted(set(sample['view_elevations']))
+                print(f"Elevations used: {unique_elevs}")
+                for elev in unique_elevs:
+                    count = sum(1 for e in sample['view_elevations'] if e == elev)
+                    print(f"  Elevation {elev}°: {count} views")
             MVCNNDataset.printed_view_count = True
+        
         for view_file in sample['view_files']:
             img = Image.open(view_file).convert('RGB')
             if self.transform:
                 img = self.transform(img)
             views.append(img)
         views = torch.stack(views)
+        
+        # Convert elevation and azimuth data to tensors
+        elevations = torch.tensor(sample['view_elevations'], dtype=torch.float32) if 'view_elevations' in sample else None
+        azimuths = torch.tensor(sample['view_azimuths'], dtype=torch.float32) if 'view_azimuths' in sample else None
+    
         return {
             'views': views,
             'label': sample['class_idx'],
             'class_name': sample['class_name'],
-            'model_name': sample['model_name']
+            'model_name': sample['model_name'],
+            'elevations': elevations,
+            'azimuths': azimuths
         }
 
 # ========== MVCNN Model ==========
@@ -321,7 +388,7 @@ def main():
         # If not provided, get all classes from metadata
         with open(os.path.join(args.dataset_path, 'dataset_metadata.json'), 'r') as f:
             metadata = json.load(f)
-        selected_classes = [c['class_name'] for c in metadata['classes']]
+        selected_classes = [c.get('class_name', c.get('class')) for c in metadata['classes']]
 
     # Apply num-classes if specified
     if args.num_classes is not None:
@@ -355,10 +422,22 @@ def main():
     ])
     
     # Create datasets
-    train_dataset = MVCNNDataset(args.dataset_path, split='train', transform=train_transform, 
-                                selected_classes=selected_classes, max_views=args.max_views)
-    test_dataset = MVCNNDataset(args.dataset_path, split='test', transform=test_transform,
-                               selected_classes=selected_classes, max_views=args.max_views)
+    train_dataset = MVCNNDataset(
+        args.dataset_path, 
+        split='train', 
+        transform=train_transform, 
+        selected_classes=selected_classes, 
+        max_views=args.max_views,
+        elevations=args.elevations
+    )
+    test_dataset = MVCNNDataset(
+        args.dataset_path, 
+        split='test', 
+        transform=test_transform,
+        selected_classes=selected_classes, 
+        max_views=args.max_views,
+        elevations=args.elevations
+    )
     
     # Filter selected classes if specified
     if args.selected_classes:

@@ -8,3 +8,8 @@ mvcnn_dataset/
 mvcnn_results/
 
 motion_mvcnn_results/
+
+__pycache__/
+
+tests/
+mvcnn_dataset.bac/
